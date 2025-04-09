@@ -752,7 +752,7 @@ The fit seems appropriate for the data. Now I can construct the first part of th
 
 ```python
 synthetic = pd.DataFrame(result.forecast(test_predictions.values[-7:], steps=157))
-synthetic.columns = ['sus_ha_nusers', 'sus_ma_nusers', 'sus_la_nusers']
+synthetic.columns = ['suspended_ha_nusers', 'suspended_ma_nusers', 'suspended_la_nusers']
 ```
 
 
@@ -779,31 +779,86 @@ It seems like low- and moderate-activity users have very similar slopes, but hig
 
 
 ```python
+suspended_subset = suspended_data.loc[(suspended_data['date'] >= datetime(2020, 1, 1)) & (suspended_data['date'] <= datetime(2021, 1, 1))] # select one-year period close to (not including) onset of treatment
+suspended_subset['high_activity'] = (suspended_subset['subset_activity'] == 'ha').astype(int) # create binary variable for high activity
+
+
+nusers_lag = suspended_data.groupby('subset_activity')['nusers'].shift(1)[suspended_subset.index]
+nusers_lag_2 = suspended_data.groupby('subset_activity')['nusers'].shift(2)[suspended_subset.index]
+
+suspended_subset['nusers_lag_1'] = nusers_lag
+suspended_subset['nusers_lag_2'] = nusers_lag_2
+```
+
+Estimating priors for Bayesian ridge regression:
+
+| Variable | Formula |
+| --- | --- |
+| $\hat{\alpha}$ | $\frac{1}{\text{Var}(Y)}$ |
+| $\hat{\lambda}$ | $\text{mean}(\frac{\text{Var}(X_{j})}{\text{Var}(Y)})$ |
+| $\alpha_{2}$ | $\frac{\alpha_{1}}{\hat{\alpha}}$ |
+| $\lambda_{2}$ | $\frac{\lambda_{1}}{\hat{\lambda}}$ |
+
+
+```python
 from sklearn.linear_model import BayesianRidge
 from sklearn.model_selection import train_test_split, GridSearchCV
 
-suspended_subset = suspended_data.loc[(suspended_data['date'] >= datetime(2020, 1, 1)) & (suspended_data['date'] <= datetime(2021, 1, 1))] # select one-year period close to (not including) onset of treatment
-suspended_subset['high_activity'] = (suspended_subset['subset_activity'] == 'ha').astype(int) # create binary variable for high activity
-X = suspended_subset[['high_activity', 'nusers']]
+X = suspended_subset[['high_activity', 'nusers', 'nusers_lag_1', 'nusers_lag_2']]
 Y = suspended_subset['n']
+```
 
-X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=0.25, random_state=25)
 
-model = BayesianRidge(lambda_2=1e-3, alpha_1=1e-3, tol=1e-4, alpha_2=5e-5)
+```python
+alpha_empirical = 1.0 / np.var(Y)
+X_var_mean = np.var(X, axis=0).mean()
+lambda_empirical = X_var_mean / np.var(Y)
+params = {'alpha_1': [], 'alpha_2': [], 'lambda_1': [], 'lambda_2': []}
+for alph in [1e-5, 1e-4, 1e-3]:
+    for lamb in [1e-6, 1e-5, 1e-4]:
+        params['alpha_1'].append(alph)
+        a2 = alph / alpha_empirical
+        params['alpha_2'].append(a2)
+        params['lambda_1'].append(lamb)
+        l2 = lamb / lambda_empirical
+        params['lambda_2'].append(l2)
+list(set(params['alpha_2'])), list(set(params['lambda_2']))
+```
+
+
+
+
+    ([5585.667987997039, 558.566798799704, 55.85667987997039],
+     [0.11026663535377246, 0.011026663535377247, 0.0011026663535377245])
+
+
+
+
+```python
+X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=0.2, random_state=25)
+
+model = BayesianRidge(tol=1e-4)
 params = {
-    'lambda_1': np.linspace(1e-10, 6e-10, 7),
+    'lambda_1': [1e-3, 1e-2, 1e-1, 1e1],
+    'lambda_2': [1e-3/lambda_empirical, 1e-2/lambda_empirical, 1e-1/lambda_empirical, 1e1/lambda_empirical],
+    'alpha_1': [1e-7, 1e-6],
+    'alpha_2': [1e-7/lambda_empirical, 1e-6/lambda_empirical]
 }
-grid_search = GridSearchCV(model, params, cv=4)
+
+grid_search = GridSearchCV(model, params, cv=4, verbose=1, n_jobs=3)
 grid_search.fit(X_train, Y_train)
 best_model = grid_search.best_estimator_
 ```
+
+    Fitting 4 folds for each of 64 candidates, totalling 256 fits
+
 
 
 ```python
 print(f"Training score: {best_model.score(X_train, Y_train)}, Test score: {best_model.score(X_test, Y_test)}")
 ```
 
-    Training score: 0.8763366599345839, Test score: 0.8980982570396228
+    Training score: 0.8781430150110917, Test score: 0.9027241271591266
 
 
 Now I can use this model to predict total content for suspended users using my predictions for number of users.
@@ -811,437 +866,140 @@ Now I can use this model to predict total content for suspended users using my p
 
 ```python
 def suspended_n_prediction(activity):
-    nusers = synthetic[[f'sus_{activity}_nusers']]
+    nusers = synthetic[[f'suspended_{activity}_nusers']].apply(np.square)
     nusers.columns = ['nusers']
+    nusers_lag1 = nusers.shift(1)
+    nusers_lag1.columns = ['nusers_lag_1']
+    nusers_lag2 = nusers.shift(2)
+    nusers_lag2.columns = ['nusers_lag_2']
     if activity == 'ha':
         high_activity = 1
     else:
         high_activity = 0
     nusers['high_activity'] = high_activity
-    nusers = nusers.reindex(columns=['high_activity', 'nusers'])
-    return best_model.predict(nusers)
+    nusers['nusers_lag_1'] = nusers_lag1
+    nusers['nusers_lag_2'] = nusers_lag2
+    nusers = nusers.reindex(columns=['high_activity', 'nusers', 'nusers_lag_1', 'nusers_lag_2'])
+    return best_model.predict(nusers.iloc[2:])
 
-synthetic['suspended_ha_n'] = suspended_n_prediction('ha')
-synthetic['suspended_ma_n'] = suspended_n_prediction('ma')
-synthetic['suspended_la_n'] = suspended_n_prediction('la')
+synthetic.loc[2:, 'suspended_ha_n'] = suspended_n_prediction('ha')
+synthetic.loc[2:, 'suspended_ma_n'] = suspended_n_prediction('ma')
+synthetic.loc[2:, 'suspended_la_n'] = suspended_n_prediction('la')
 ```
 
 
 ```python
-suspended_subset.reset_index().set_index(['subset_activity', 'date']).shift(1).reset_index()
+n_lag1 = suspended_data.groupby('subset_activity')['n'].shift(1)[suspended_subset.index]
+n_lag2 = suspended_data.groupby('subset_activity')['n'].shift(2)[suspended_subset.index]
+suspended_subset['n_lag_1'] = n_lag1
+suspended_subset['n_lag_2'] = n_lag2
+low_activity = (suspended_subset['subset_activity'] == 'la').astype(int)
+suspended_subset['low_activity'] = low_activity
+
+def model_not_fake(feature, df):
+    feat_lag = df.groupby('subset_activity')[feature].shift(1)
+    feat_lag2 = df.groupby('subset_activity')[feature].shift(2)
+    df_ = df.copy().iloc[6:]
+    df_[f'{feature}_lag_1'] = feat_lag
+    df_[f'{feature}_lag_2'] = feat_lag2
+    X = df_[['n', 'n_lag_1', 'low_activity', f'{feature}_lag_1', f'{feature}_lag_2', 'high_activity', 'nusers_lag_1', 'nusers']]
+    Y = df_[feature]
+    X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.2, random_state=4)
+    alpha_emp = 1.0 / np.var(Y)
+    lambda_emp = (np.var(X, axis=0).mean()) / np.var(Y)
+    params = {
+        'alpha_1': [1e-7, 1e-6, 1e-5],
+        'alpha_2': [1e-7/alpha_emp, 1e-6/alpha_emp, 1e-5/alpha_emp],
+        'lambda_1': [1e-6, 1e-5, 1e-4],
+        'lambda_2': [1e-6/lambda_emp, 1e-5/lambda_emp, 1e-4/lambda_emp]
+    }
+    model = BayesianRidge()
+    grid_search = GridSearchCV(model, params, cv=3, n_jobs=2, verbose=1)
+    grid_search.fit(X_train, y_train)
+    best_model = grid_search.best_estimator_
+    print(best_model.score(X_train, y_train), best_model.score(X_test, y_test))
+    return best_model
+
+best_model_nfc = model_not_fake('not_fake_conservative', suspended_subset)
+best_model_nfl = model_not_fake('not_fake_liberal', suspended_subset)
 ```
 
-
-
-
-<div>
-<style scoped>
-    .dataframe tbody tr th:only-of-type {
-        vertical-align: middle;
-    }
-
-    .dataframe tbody tr th {
-        vertical-align: top;
-    }
-
-    .dataframe thead th {
-        text-align: right;
-    }
-</style>
-<table border="1" class="dataframe">
-  <thead>
-    <tr style="text-align: right;">
-      <th></th>
-      <th>subset_activity</th>
-      <th>date</th>
-      <th>index</th>
-      <th>subset_group</th>
-      <th>nusers</th>
-      <th>n</th>
-      <th>fm</th>
-      <th>not_fake_conservative</th>
-      <th>not_fake_liberal</th>
-      <th>not_fake_shopping</th>
-      <th>not_fake_sports</th>
-      <th>high_activity</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <th>0</th>
-      <td>ha</td>
-      <td>2020-01-01</td>
-      <td>NaN</td>
-      <td>None</td>
-      <td>NaN</td>
-      <td>NaN</td>
-      <td>NaN</td>
-      <td>NaN</td>
-      <td>NaN</td>
-      <td>NaN</td>
-      <td>NaN</td>
-      <td>NaN</td>
-    </tr>
-    <tr>
-      <th>1</th>
-      <td>la</td>
-      <td>2020-01-01</td>
-      <td>39.0</td>
-      <td>suspended</td>
-      <td>170.0</td>
-      <td>2353.0</td>
-      <td>726.0</td>
-      <td>194.0</td>
-      <td>37.0</td>
-      <td>5.0</td>
-      <td>0.0</td>
-      <td>1.0</td>
-    </tr>
-    <tr>
-      <th>2</th>
-      <td>ma</td>
-      <td>2020-01-01</td>
-      <td>40.0</td>
-      <td>suspended</td>
-      <td>7.0</td>
-      <td>11.0</td>
-      <td>2.0</td>
-      <td>0.0</td>
-      <td>1.0</td>
-      <td>0.0</td>
-      <td>0.0</td>
-      <td>0.0</td>
-    </tr>
-    <tr>
-      <th>3</th>
-      <td>ha</td>
-      <td>2020-01-02</td>
-      <td>41.0</td>
-      <td>suspended</td>
-      <td>132.0</td>
-      <td>524.0</td>
-      <td>112.0</td>
-      <td>43.0</td>
-      <td>13.0</td>
-      <td>1.0</td>
-      <td>1.0</td>
-      <td>0.0</td>
-    </tr>
-    <tr>
-      <th>4</th>
-      <td>la</td>
-      <td>2020-01-02</td>
-      <td>42.0</td>
-      <td>suspended</td>
-      <td>175.0</td>
-      <td>3164.0</td>
-      <td>923.0</td>
-      <td>356.0</td>
-      <td>47.0</td>
-      <td>4.0</td>
-      <td>3.0</td>
-      <td>1.0</td>
-    </tr>
-    <tr>
-      <th>...</th>
-      <td>...</td>
-      <td>...</td>
-      <td>...</td>
-      <td>...</td>
-      <td>...</td>
-      <td>...</td>
-      <td>...</td>
-      <td>...</td>
-      <td>...</td>
-      <td>...</td>
-      <td>...</td>
-      <td>...</td>
-    </tr>
-    <tr>
-      <th>1096</th>
-      <td>la</td>
-      <td>2020-12-31</td>
-      <td>1134.0</td>
-      <td>suspended</td>
-      <td>178.0</td>
-      <td>4672.0</td>
-      <td>1632.0</td>
-      <td>405.0</td>
-      <td>22.0</td>
-      <td>4.0</td>
-      <td>6.0</td>
-      <td>1.0</td>
-    </tr>
-    <tr>
-      <th>1097</th>
-      <td>ma</td>
-      <td>2020-12-31</td>
-      <td>1135.0</td>
-      <td>suspended</td>
-      <td>75.0</td>
-      <td>732.0</td>
-      <td>252.0</td>
-      <td>55.0</td>
-      <td>6.0</td>
-      <td>0.0</td>
-      <td>0.0</td>
-      <td>0.0</td>
-    </tr>
-    <tr>
-      <th>1098</th>
-      <td>ha</td>
-      <td>2021-01-01</td>
-      <td>1136.0</td>
-      <td>suspended</td>
-      <td>177.0</td>
-      <td>1778.0</td>
-      <td>593.0</td>
-      <td>149.0</td>
-      <td>18.0</td>
-      <td>1.0</td>
-      <td>0.0</td>
-      <td>0.0</td>
-    </tr>
-    <tr>
-      <th>1099</th>
-      <td>la</td>
-      <td>2021-01-01</td>
-      <td>1137.0</td>
-      <td>suspended</td>
-      <td>181.0</td>
-      <td>5006.0</td>
-      <td>1547.0</td>
-      <td>323.0</td>
-      <td>13.0</td>
-      <td>9.0</td>
-      <td>0.0</td>
-      <td>1.0</td>
-    </tr>
-    <tr>
-      <th>1100</th>
-      <td>ma</td>
-      <td>2021-01-01</td>
-      <td>1138.0</td>
-      <td>suspended</td>
-      <td>66.0</td>
-      <td>907.0</td>
-      <td>262.0</td>
-      <td>36.0</td>
-      <td>2.0</td>
-      <td>0.0</td>
-      <td>0.0</td>
-      <td>0.0</td>
-    </tr>
-  </tbody>
-</table>
-<p>1101 rows × 12 columns</p>
-</div>
-
+    Fitting 3 folds for each of 81 candidates, totalling 243 fits
+    0.9559598690360795 0.9598868567765858
+    Fitting 3 folds for each of 81 candidates, totalling 243 fits
+    0.818602879190197 0.840032615395452
 
 
 
 ```python
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.multioutput import MultiOutputRegressor
-
-X = suspended_subset[['subset_activity', 'nusers', 'n']]
+nfc = suspended.reset_index().pivot(index='date', columns='subset_activity', values='not_fake_conservative').loc['2021-01-02':'2021-01-04']
+nfl = suspended.reset_index().pivot(index='date', columns='subset_activity', values='not_fake_liberal').loc['2021-01-02':'2021-01-04']
+for col in nfc.columns:
+    synthetic.loc[:2, f'suspended_{col}_not_fake_conservative'] = nfc[col].values
+    synthetic.loc[:2, f'suspended_{col}_not_fake_liberal'] = nfl[col].values
 ```
 
 
+```python
+synthetic_full = synthetic.copy()
+synthetic_lag1 = synthetic.shift(1)
+synthetic_lag1.columns = [f"{c}_lag_1" for c in synthetic.columns]
+synthetic_lag2 = synthetic.shift(2)
+synthetic_lag2.columns = [f"{c}_lag_2" for c in synthetic.columns]
+synthetic_full = pd.concat([synthetic_full, synthetic_lag1, synthetic_lag2], axis=1)
+```
 
 
-<div>
-<style scoped>
-    .dataframe tbody tr th:only-of-type {
-        vertical-align: middle;
-    }
+```python
+def suspended_feature_predictions(feature, activity, row):
+    if activity == 'ha':
+        high_activity = 1
+    else:
+        high_activity = 0
+    if activity == 'la':
+        low_activity = 1
+    else:
+        low_activity = 0
+    nusers = np.square(row[f'suspended_{activity}_nusers'])
+    nusers_lag1 = np.square(row[f'suspended_{activity}_nusers_lag_1'])
+    n = row[f'suspended_{activity}_n']
+    n_lag1 = row[f'suspended_{activity}_n_lag_1']
+    feature_lag1 = row[f'suspended_{activity}_{feature}_lag_1']
+    feature_lag2 = row[f'suspended_{activity}_{feature}_lag_2']
+    row_x = pd.DataFrame({'n': n, 'n_lag_1': n_lag1, 'low_activity': low_activity, f'{feature}_lag_1': feature_lag1, f'{feature}_lag_2': feature_lag2, 'high_activity': high_activity, 'nusers_lag_1': nusers_lag1, 'nusers': nusers}, index=[0])
+    return row_x
 
-    .dataframe tbody tr th {
-        vertical-align: top;
-    }
+def predict_sequence(df, nfc, nfl, n_steps=None):
+    result_df = df.copy().reset_index(drop=True)
+    if n_steps is None:
+        n_steps = len(df)
+    else:
+        n_steps = min(n_steps, len(result_df))
+    for i in range(n_steps):
+        if i >= len(result_df):
+            break
+        row = result_df.iloc[i]
+        for activity in ['ha', 'ma', 'la']:
+            row_x_c = suspended_feature_predictions('not_fake_conservative', activity, row)
+            nfc_pred = nfc.predict(row_x_c)
+            result_df.loc[i, f'suspended_{activity}_not_fake_conservative'] = nfc_pred
+            row_x_l = suspended_feature_predictions('not_fake_liberal', activity, row)
+            nfl_pred = nfl.predict(row_x_l)
+            result_df.loc[i, f'suspended_{activity}_not_fake_liberal'] = nfl_pred
 
-    .dataframe thead th {
-        text-align: right;
-    }
-</style>
-<table border="1" class="dataframe">
-  <thead>
-    <tr style="text-align: right;">
-      <th></th>
-      <th>date</th>
-      <th>subset_group</th>
-      <th>subset_activity</th>
-      <th>nusers</th>
-      <th>n</th>
-      <th>fm</th>
-      <th>not_fake_conservative</th>
-      <th>not_fake_liberal</th>
-      <th>not_fake_shopping</th>
-      <th>not_fake_sports</th>
-      <th>high_activity</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <th>39</th>
-      <td>2020-01-01</td>
-      <td>suspended</td>
-      <td>ha</td>
-      <td>170</td>
-      <td>2353.0</td>
-      <td>726.0</td>
-      <td>194.0</td>
-      <td>37.0</td>
-      <td>5.0</td>
-      <td>0.0</td>
-      <td>1</td>
-    </tr>
-    <tr>
-      <th>40</th>
-      <td>2020-01-01</td>
-      <td>suspended</td>
-      <td>la</td>
-      <td>7</td>
-      <td>11.0</td>
-      <td>2.0</td>
-      <td>0.0</td>
-      <td>1.0</td>
-      <td>0.0</td>
-      <td>0.0</td>
-      <td>0</td>
-    </tr>
-    <tr>
-      <th>41</th>
-      <td>2020-01-01</td>
-      <td>suspended</td>
-      <td>ma</td>
-      <td>132</td>
-      <td>524.0</td>
-      <td>112.0</td>
-      <td>43.0</td>
-      <td>13.0</td>
-      <td>1.0</td>
-      <td>1.0</td>
-      <td>0</td>
-    </tr>
-    <tr>
-      <th>42</th>
-      <td>2020-01-02</td>
-      <td>suspended</td>
-      <td>ha</td>
-      <td>175</td>
-      <td>3164.0</td>
-      <td>923.0</td>
-      <td>356.0</td>
-      <td>47.0</td>
-      <td>4.0</td>
-      <td>3.0</td>
-      <td>1</td>
-    </tr>
-    <tr>
-      <th>43</th>
-      <td>2020-01-02</td>
-      <td>suspended</td>
-      <td>la</td>
-      <td>9</td>
-      <td>14.0</td>
-      <td>0.0</td>
-      <td>1.0</td>
-      <td>0.0</td>
-      <td>0.0</td>
-      <td>0.0</td>
-      <td>0</td>
-    </tr>
-    <tr>
-      <th>...</th>
-      <td>...</td>
-      <td>...</td>
-      <td>...</td>
-      <td>...</td>
-      <td>...</td>
-      <td>...</td>
-      <td>...</td>
-      <td>...</td>
-      <td>...</td>
-      <td>...</td>
-      <td>...</td>
-    </tr>
-    <tr>
-      <th>1135</th>
-      <td>2020-12-31</td>
-      <td>suspended</td>
-      <td>la</td>
-      <td>75</td>
-      <td>732.0</td>
-      <td>252.0</td>
-      <td>55.0</td>
-      <td>6.0</td>
-      <td>0.0</td>
-      <td>0.0</td>
-      <td>0</td>
-    </tr>
-    <tr>
-      <th>1136</th>
-      <td>2020-12-31</td>
-      <td>suspended</td>
-      <td>ma</td>
-      <td>177</td>
-      <td>1778.0</td>
-      <td>593.0</td>
-      <td>149.0</td>
-      <td>18.0</td>
-      <td>1.0</td>
-      <td>0.0</td>
-      <td>0</td>
-    </tr>
-    <tr>
-      <th>1137</th>
-      <td>2021-01-01</td>
-      <td>suspended</td>
-      <td>ha</td>
-      <td>181</td>
-      <td>5006.0</td>
-      <td>1547.0</td>
-      <td>323.0</td>
-      <td>13.0</td>
-      <td>9.0</td>
-      <td>0.0</td>
-      <td>1</td>
-    </tr>
-    <tr>
-      <th>1138</th>
-      <td>2021-01-01</td>
-      <td>suspended</td>
-      <td>la</td>
-      <td>66</td>
-      <td>907.0</td>
-      <td>262.0</td>
-      <td>36.0</td>
-      <td>2.0</td>
-      <td>0.0</td>
-      <td>0.0</td>
-      <td>0</td>
-    </tr>
-    <tr>
-      <th>1139</th>
-      <td>2021-01-01</td>
-      <td>suspended</td>
-      <td>ma</td>
-      <td>184</td>
-      <td>1600.0</td>
-      <td>467.0</td>
-      <td>72.0</td>
-      <td>10.0</td>
-      <td>2.0</td>
-      <td>0.0</td>
-      <td>0</td>
-    </tr>
-  </tbody>
-</table>
-<p>1101 rows × 11 columns</p>
-</div>
+            if i + 1 < len(result_df):
+                result_df.loc[i + 1, f'suspended_{activity}_not_fake_conservative_lag_1'] = nfc_pred
+                result_df.loc[i + 1, f'suspended_{activity}_not_fake_liberal_lag_1'] = nfl_pred
+            if i + 2 < len(result_df):
+                result_df.loc[i + 2, f'suspended_{activity}_not_fake_conservative_lag_2'] = nfc_pred
+                result_df.loc[i + 2, f'suspended_{activity}_not_fake_liberal_lag_2'] = nfl_pred
+    return result_df
+```
 
 
+```python
+synth_full = predict_sequence(synthetic_full.iloc[3:], best_model_nfc, best_model_nfl)
+```
 
 ### Modeling Other Users
 
@@ -1293,105 +1051,53 @@ mm("""
 
 
     
-![png](cleaned-project-1_files/cleaned-project-1_66_0.png)
+![png](cleaned-project-1_files/cleaned-project-1_73_0.png)
     
 
 
-I will standardize number of users and total content, but the other features are all on different scales. To allow for better comparisons without introducing bias, I will standardize the other features relative to the total content put out by each group.
-
 
 ```python
-def standardize_group(subset, activity_level, df_):
-    result = {}
-    df = df_.copy().reset_index(drop=True)
-    for suffix in ['', '_lag_1', '_lag_2']:
-        n_col = f"{subset}_{activity_level}_n{suffix}"
-        nusers_col = f"{subset}_{activity_level}_nusers{suffix}"
-        if n_col in df.columns and nusers_col in df.columns:
-            n = df[n_col]
-            nusers = df[nusers_col]
-            n_per_user = n / nusers.replace(0, np.nan)
-            n_per_user = n_per_user.fillna(0)
-
-            result[n_col] = n_per_user
-            result[nusers_col] = nusers
-
-            prefix = f"{subset}_{activity_level}_"
-            for col in df.columns:
-                if col.startswith(prefix) and col.endswith(suffix) and col not in [n_col, nusers_col]:
-                    new_col_name = col
-                    _values = df[col]
-                    standardized_values = _values / n_per_user.replace(0, np.nan)
-                    standardized_values = standardized_values.fillna(0)
-                    result[new_col_name] = standardized_values
-
-    return pd.DataFrame(result)
+nusers_columns = [c for c in wide_subset.columns if 'nusers' in c and 'lag' not in c and 'suspended' not in c]
+nusers_lag_columns = [c for c in wide_subset.columns if 'nusers' in c and ('lag' in c or 'suspended' in c)]
 ```
 
 
 ```python
-standardized_columns = []
-for subset in ['A', 'B', 'D', 'F', 'suspended', 'nfns']:
-    for activity_level in ['ha', 'ma', 'la']:
-        sub = standardize_group(subset, activity_level, wide_subset)
-        standardized_columns.append(sub)
-standardized_df = pd.concat(standardized_columns, axis=1)
-```
-
-
-```python
-nusers_columns = [c for c in standardized_df.columns if 'nusers' in c]
-nusers_lag_columns = [c for c in nusers_columns if 'lag' in c]
-suspended_columns = [c for c in standardized_df.columns if ('suspended' in c) & (re.search(r'_n(?=[_\b])', c) is not None)]
-X_ = standardized_df[list(set(nusers_lag_columns + suspended_columns))]
-Y = standardized_df[[c for c in nusers_columns if (c not in nusers_lag_columns) and (c not in suspended_columns)]]
-```
-
-
-```python
-from sklearn.svm import NuSVR
-from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.multioutput import MultiOutputRegressor
-from sklearn.preprocessing import StandardScaler
+X = wide_subset[nusers_lag_columns]
+Y = wide_subset[nusers_columns]
 
-scaler = StandardScaler()
-X = scaler.fit_transform(X_)
-y = scaler.fit_transform(Y)
-X_train, X_test, Y_train, Y_test = train_test_split(X, y, test_size=0.2, random_state=40)
-model = NuSVR()
+X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=0.25, random_state=4)
 params = {
-    'C': [0.25, 0.5, 1],
-    'nu': [0.1, 0.25, 0.5],
-    'kernel': ['linear', 'poly', 'rbf'],
-    'tol': [1e-5, 1e-4, 1e-3],
-    'degree': [2, 3, 4]
+    'alpha_1': [1e-8, 1e-7, 1e-6, 1e-4],
+    'alpha_2': [1e-7/1.056e-8, 1e-6/1.056e-8, 1e-4/1.056e-8],
+    'lambda_1': [1e-6, 1e-4, 1e-3],
+    'lambda_2': [7.170119605e9, 1.58551568e5, 1.58551568e3],
 }
-grid_search = GridSearchCV(model, params, cv=3, verbose=1, n_jobs=3, pre_dispatch='2*n_jobs')
-mr = MultiOutputRegressor(grid_search)
+br = BayesianRidge()
+grid_search = GridSearchCV(br, params, cv=4, n_jobs=2, verbose=1)
+mr = MultiOutputRegressor(grid_search, n_jobs=2)
 mr.fit(X_train, Y_train)
 ```
 
-    Fitting 3 folds for each of 243 candidates, totalling 729 fits
-    Fitting 3 folds for each of 243 candidates, totalling 729 fits
-    Fitting 3 folds for each of 243 candidates, totalling 729 fits
-    Fitting 3 folds for each of 243 candidates, totalling 729 fits
-    Fitting 3 folds for each of 243 candidates, totalling 729 fits
-    Fitting 3 folds for each of 243 candidates, totalling 729 fits
-    Fitting 3 folds for each of 243 candidates, totalling 729 fits
-    Fitting 3 folds for each of 243 candidates, totalling 729 fits
-    Fitting 3 folds for each of 243 candidates, totalling 729 fits
-    Fitting 3 folds for each of 243 candidates, totalling 729 fits
-    Fitting 3 folds for each of 243 candidates, totalling 729 fits
-    Fitting 3 folds for each of 243 candidates, totalling 729 fits
-    Fitting 3 folds for each of 243 candidates, totalling 729 fits
-    Fitting 3 folds for each of 243 candidates, totalling 729 fits
-    Fitting 3 folds for each of 243 candidates, totalling 729 fits
+    Fitting 4 folds for each of 108 candidates, totalling 432 fits
+    Fitting 4 folds for each of 108 candidates, totalling 432 fits
+    Fitting 4 folds for each of 108 candidates, totalling 432 fits
+    Fitting 4 folds for each of 108 candidates, totalling 432 fits
+    Fitting 4 folds for each of 108 candidates, totalling 432 fits
+    Fitting 4 folds for each of 108 candidates, totalling 432 fits
+    Fitting 4 folds for each of 108 candidates, totalling 432 fits
+    Fitting 4 folds for each of 108 candidates, totalling 432 fits
+    Fitting 4 folds for each of 108 candidates, totalling 432 fits
+    Fitting 4 folds for each of 108 candidates, totalling 432 fits
+    Fitting 4 folds for each of 108 candidates, totalling 432 fits
+    Fitting 4 folds for each of 108 candidates, totalling 432 fits
 
 
 
 
 
-<style>#sk-container-id-37 {
+<style>#sk-container-id-43 {
   /* Definition of color scheme common for light and dark mode */
   --sklearn-color-text: black;
   --sklearn-color-line: gray;
@@ -1421,15 +1127,15 @@ mr.fit(X_train, Y_train)
   }
 }
 
-#sk-container-id-37 {
+#sk-container-id-43 {
   color: var(--sklearn-color-text);
 }
 
-#sk-container-id-37 pre {
+#sk-container-id-43 pre {
   padding: 0;
 }
 
-#sk-container-id-37 input.sk-hidden--visually {
+#sk-container-id-43 input.sk-hidden--visually {
   border: 0;
   clip: rect(1px 1px 1px 1px);
   clip: rect(1px, 1px, 1px, 1px);
@@ -1441,7 +1147,7 @@ mr.fit(X_train, Y_train)
   width: 1px;
 }
 
-#sk-container-id-37 div.sk-dashed-wrapped {
+#sk-container-id-43 div.sk-dashed-wrapped {
   border: 1px dashed var(--sklearn-color-line);
   margin: 0 0.4em 0.5em 0.4em;
   box-sizing: border-box;
@@ -1449,7 +1155,7 @@ mr.fit(X_train, Y_train)
   background-color: var(--sklearn-color-background);
 }
 
-#sk-container-id-37 div.sk-container {
+#sk-container-id-43 div.sk-container {
   /* jupyter's `normalize.less` sets `[hidden] { display: none; }`
      but bootstrap.min.css set `[hidden] { display: none !important; }`
      so we also need the `!important` here to be able to override the
@@ -1459,7 +1165,7 @@ mr.fit(X_train, Y_train)
   position: relative;
 }
 
-#sk-container-id-37 div.sk-text-repr-fallback {
+#sk-container-id-43 div.sk-text-repr-fallback {
   display: none;
 }
 
@@ -1475,14 +1181,14 @@ div.sk-item {
 
 /* Parallel-specific style estimator block */
 
-#sk-container-id-37 div.sk-parallel-item::after {
+#sk-container-id-43 div.sk-parallel-item::after {
   content: "";
   width: 100%;
   border-bottom: 2px solid var(--sklearn-color-text-on-default-background);
   flex-grow: 1;
 }
 
-#sk-container-id-37 div.sk-parallel {
+#sk-container-id-43 div.sk-parallel {
   display: flex;
   align-items: stretch;
   justify-content: center;
@@ -1490,28 +1196,28 @@ div.sk-item {
   position: relative;
 }
 
-#sk-container-id-37 div.sk-parallel-item {
+#sk-container-id-43 div.sk-parallel-item {
   display: flex;
   flex-direction: column;
 }
 
-#sk-container-id-37 div.sk-parallel-item:first-child::after {
+#sk-container-id-43 div.sk-parallel-item:first-child::after {
   align-self: flex-end;
   width: 50%;
 }
 
-#sk-container-id-37 div.sk-parallel-item:last-child::after {
+#sk-container-id-43 div.sk-parallel-item:last-child::after {
   align-self: flex-start;
   width: 50%;
 }
 
-#sk-container-id-37 div.sk-parallel-item:only-child::after {
+#sk-container-id-43 div.sk-parallel-item:only-child::after {
   width: 0;
 }
 
 /* Serial-specific style estimator block */
 
-#sk-container-id-37 div.sk-serial {
+#sk-container-id-43 div.sk-serial {
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -1529,14 +1235,14 @@ clickable and can be expanded/collapsed.
 
 /* Pipeline and ColumnTransformer style (default) */
 
-#sk-container-id-37 div.sk-toggleable {
+#sk-container-id-43 div.sk-toggleable {
   /* Default theme specific background. It is overwritten whether we have a
   specific estimator or a Pipeline/ColumnTransformer */
   background-color: var(--sklearn-color-background);
 }
 
 /* Toggleable label */
-#sk-container-id-37 label.sk-toggleable__label {
+#sk-container-id-43 label.sk-toggleable__label {
   cursor: pointer;
   display: block;
   width: 100%;
@@ -1546,7 +1252,7 @@ clickable and can be expanded/collapsed.
   text-align: center;
 }
 
-#sk-container-id-37 label.sk-toggleable__label-arrow:before {
+#sk-container-id-43 label.sk-toggleable__label-arrow:before {
   /* Arrow on the left of the label */
   content: "▸";
   float: left;
@@ -1554,13 +1260,13 @@ clickable and can be expanded/collapsed.
   color: var(--sklearn-color-icon);
 }
 
-#sk-container-id-37 label.sk-toggleable__label-arrow:hover:before {
+#sk-container-id-43 label.sk-toggleable__label-arrow:hover:before {
   color: var(--sklearn-color-text);
 }
 
 /* Toggleable content - dropdown */
 
-#sk-container-id-37 div.sk-toggleable__content {
+#sk-container-id-43 div.sk-toggleable__content {
   max-height: 0;
   max-width: 0;
   overflow: hidden;
@@ -1569,12 +1275,12 @@ clickable and can be expanded/collapsed.
   background-color: var(--sklearn-color-unfitted-level-0);
 }
 
-#sk-container-id-37 div.sk-toggleable__content.fitted {
+#sk-container-id-43 div.sk-toggleable__content.fitted {
   /* fitted */
   background-color: var(--sklearn-color-fitted-level-0);
 }
 
-#sk-container-id-37 div.sk-toggleable__content pre {
+#sk-container-id-43 div.sk-toggleable__content pre {
   margin: 0.2em;
   border-radius: 0.25em;
   color: var(--sklearn-color-text);
@@ -1582,79 +1288,79 @@ clickable and can be expanded/collapsed.
   background-color: var(--sklearn-color-unfitted-level-0);
 }
 
-#sk-container-id-37 div.sk-toggleable__content.fitted pre {
+#sk-container-id-43 div.sk-toggleable__content.fitted pre {
   /* unfitted */
   background-color: var(--sklearn-color-fitted-level-0);
 }
 
-#sk-container-id-37 input.sk-toggleable__control:checked~div.sk-toggleable__content {
+#sk-container-id-43 input.sk-toggleable__control:checked~div.sk-toggleable__content {
   /* Expand drop-down */
   max-height: 200px;
   max-width: 100%;
   overflow: auto;
 }
 
-#sk-container-id-37 input.sk-toggleable__control:checked~label.sk-toggleable__label-arrow:before {
+#sk-container-id-43 input.sk-toggleable__control:checked~label.sk-toggleable__label-arrow:before {
   content: "▾";
 }
 
 /* Pipeline/ColumnTransformer-specific style */
 
-#sk-container-id-37 div.sk-label input.sk-toggleable__control:checked~label.sk-toggleable__label {
+#sk-container-id-43 div.sk-label input.sk-toggleable__control:checked~label.sk-toggleable__label {
   color: var(--sklearn-color-text);
   background-color: var(--sklearn-color-unfitted-level-2);
 }
 
-#sk-container-id-37 div.sk-label.fitted input.sk-toggleable__control:checked~label.sk-toggleable__label {
+#sk-container-id-43 div.sk-label.fitted input.sk-toggleable__control:checked~label.sk-toggleable__label {
   background-color: var(--sklearn-color-fitted-level-2);
 }
 
 /* Estimator-specific style */
 
 /* Colorize estimator box */
-#sk-container-id-37 div.sk-estimator input.sk-toggleable__control:checked~label.sk-toggleable__label {
+#sk-container-id-43 div.sk-estimator input.sk-toggleable__control:checked~label.sk-toggleable__label {
   /* unfitted */
   background-color: var(--sklearn-color-unfitted-level-2);
 }
 
-#sk-container-id-37 div.sk-estimator.fitted input.sk-toggleable__control:checked~label.sk-toggleable__label {
+#sk-container-id-43 div.sk-estimator.fitted input.sk-toggleable__control:checked~label.sk-toggleable__label {
   /* fitted */
   background-color: var(--sklearn-color-fitted-level-2);
 }
 
-#sk-container-id-37 div.sk-label label.sk-toggleable__label,
-#sk-container-id-37 div.sk-label label {
+#sk-container-id-43 div.sk-label label.sk-toggleable__label,
+#sk-container-id-43 div.sk-label label {
   /* The background is the default theme color */
   color: var(--sklearn-color-text-on-default-background);
 }
 
 /* On hover, darken the color of the background */
-#sk-container-id-37 div.sk-label:hover label.sk-toggleable__label {
+#sk-container-id-43 div.sk-label:hover label.sk-toggleable__label {
   color: var(--sklearn-color-text);
   background-color: var(--sklearn-color-unfitted-level-2);
 }
 
 /* Label box, darken color on hover, fitted */
-#sk-container-id-37 div.sk-label.fitted:hover label.sk-toggleable__label.fitted {
+#sk-container-id-43 div.sk-label.fitted:hover label.sk-toggleable__label.fitted {
   color: var(--sklearn-color-text);
   background-color: var(--sklearn-color-fitted-level-2);
 }
 
 /* Estimator label */
 
-#sk-container-id-37 div.sk-label label {
+#sk-container-id-43 div.sk-label label {
   font-family: monospace;
   font-weight: bold;
   display: inline-block;
   line-height: 1.2em;
 }
 
-#sk-container-id-37 div.sk-label-container {
+#sk-container-id-43 div.sk-label-container {
   text-align: center;
 }
 
 /* Estimator-specific */
-#sk-container-id-37 div.sk-estimator {
+#sk-container-id-43 div.sk-estimator {
   font-family: monospace;
   border: 1px dotted var(--sklearn-color-border-box);
   border-radius: 0.25em;
@@ -1664,18 +1370,18 @@ clickable and can be expanded/collapsed.
   background-color: var(--sklearn-color-unfitted-level-0);
 }
 
-#sk-container-id-37 div.sk-estimator.fitted {
+#sk-container-id-43 div.sk-estimator.fitted {
   /* fitted */
   background-color: var(--sklearn-color-fitted-level-0);
 }
 
 /* on hover */
-#sk-container-id-37 div.sk-estimator:hover {
+#sk-container-id-43 div.sk-estimator:hover {
   /* unfitted */
   background-color: var(--sklearn-color-unfitted-level-2);
 }
 
-#sk-container-id-37 div.sk-estimator.fitted:hover {
+#sk-container-id-43 div.sk-estimator.fitted:hover {
   /* fitted */
   background-color: var(--sklearn-color-fitted-level-2);
 }
@@ -1762,7 +1468,7 @@ div.sk-label-container:hover .sk-estimator-doc-link.fitted:hover,
 
 /* "?"-specific style due to the `<a>` HTML tag */
 
-#sk-container-id-37 a.estimator_doc_link {
+#sk-container-id-43 a.estimator_doc_link {
   float: right;
   font-size: 1rem;
   line-height: 1em;
@@ -1777,48 +1483,63 @@ div.sk-label-container:hover .sk-estimator-doc-link.fitted:hover,
   border: var(--sklearn-color-unfitted-level-1) 1pt solid;
 }
 
-#sk-container-id-37 a.estimator_doc_link.fitted {
+#sk-container-id-43 a.estimator_doc_link.fitted {
   /* fitted */
   border: var(--sklearn-color-fitted-level-1) 1pt solid;
   color: var(--sklearn-color-fitted-level-1);
 }
 
 /* On hover */
-#sk-container-id-37 a.estimator_doc_link:hover {
+#sk-container-id-43 a.estimator_doc_link:hover {
   /* unfitted */
   background-color: var(--sklearn-color-unfitted-level-3);
   color: var(--sklearn-color-background);
   text-decoration: none;
 }
 
-#sk-container-id-37 a.estimator_doc_link.fitted:hover {
+#sk-container-id-43 a.estimator_doc_link.fitted:hover {
   /* fitted */
   background-color: var(--sklearn-color-fitted-level-3);
 }
-</style><div id="sk-container-id-37" class="sk-top-container"><div class="sk-text-repr-fallback"><pre>MultiOutputRegressor(estimator=GridSearchCV(cv=3, estimator=NuSVR(), n_jobs=3,
-                                            param_grid={&#x27;C&#x27;: [0.25, 0.5, 1],
-                                                        &#x27;degree&#x27;: [2, 3, 4],
-                                                        &#x27;kernel&#x27;: [&#x27;linear&#x27;,
-                                                                   &#x27;poly&#x27;,
-                                                                   &#x27;rbf&#x27;],
-                                                        &#x27;nu&#x27;: [0.1, 0.25, 0.5],
-                                                        &#x27;tol&#x27;: [1e-05, 0.0001,
-                                                                0.001]},
-                                            verbose=1))</pre><b>In a Jupyter environment, please rerun this cell to show the HTML representation or trust the notebook. <br />On GitHub, the HTML representation is unable to render, please try loading this page with nbviewer.org.</b></div><div class="sk-container" hidden><div class="sk-item sk-dashed-wrapped"><div class="sk-label-container"><div class="sk-label fitted sk-toggleable"><input class="sk-toggleable__control sk-hidden--visually" id="sk-estimator-id-127" type="checkbox" ><label for="sk-estimator-id-127" class="sk-toggleable__label fitted sk-toggleable__label-arrow fitted">&nbsp;&nbsp;MultiOutputRegressor<a class="sk-estimator-doc-link fitted" rel="noreferrer" target="_blank" href="https://scikit-learn.org/1.5/modules/generated/sklearn.multioutput.MultiOutputRegressor.html">?<span>Documentation for MultiOutputRegressor</span></a><span class="sk-estimator-doc-link fitted">i<span>Fitted</span></span></label><div class="sk-toggleable__content fitted"><pre>MultiOutputRegressor(estimator=GridSearchCV(cv=3, estimator=NuSVR(), n_jobs=3,
-                                            param_grid={&#x27;C&#x27;: [0.25, 0.5, 1],
-                                                        &#x27;degree&#x27;: [2, 3, 4],
-                                                        &#x27;kernel&#x27;: [&#x27;linear&#x27;,
-                                                                   &#x27;poly&#x27;,
-                                                                   &#x27;rbf&#x27;],
-                                                        &#x27;nu&#x27;: [0.1, 0.25, 0.5],
-                                                        &#x27;tol&#x27;: [1e-05, 0.0001,
-                                                                0.001]},
-                                            verbose=1))</pre></div> </div></div><div class="sk-parallel"><div class="sk-parallel-item"><div class="sk-item"><div class="sk-label-container"><div class="sk-label fitted sk-toggleable"><input class="sk-toggleable__control sk-hidden--visually" id="sk-estimator-id-128" type="checkbox" ><label for="sk-estimator-id-128" class="sk-toggleable__label fitted sk-toggleable__label-arrow fitted">estimator: GridSearchCV</label><div class="sk-toggleable__content fitted"><pre>GridSearchCV(cv=3, estimator=NuSVR(), n_jobs=3,
-             param_grid={&#x27;C&#x27;: [0.25, 0.5, 1], &#x27;degree&#x27;: [2, 3, 4],
-                         &#x27;kernel&#x27;: [&#x27;linear&#x27;, &#x27;poly&#x27;, &#x27;rbf&#x27;],
-                         &#x27;nu&#x27;: [0.1, 0.25, 0.5],
-                         &#x27;tol&#x27;: [1e-05, 0.0001, 0.001]},
-             verbose=1)</pre></div> </div></div><div class="sk-serial"><div class="sk-item sk-dashed-wrapped"><div class="sk-parallel"><div class="sk-parallel-item"><div class="sk-item"><div class="sk-label-container"><div class="sk-label fitted sk-toggleable"><input class="sk-toggleable__control sk-hidden--visually" id="sk-estimator-id-129" type="checkbox" ><label for="sk-estimator-id-129" class="sk-toggleable__label fitted sk-toggleable__label-arrow fitted">estimator: NuSVR</label><div class="sk-toggleable__content fitted"><pre>NuSVR()</pre></div> </div></div><div class="sk-serial"><div class="sk-item"><div class="sk-estimator fitted sk-toggleable"><input class="sk-toggleable__control sk-hidden--visually" id="sk-estimator-id-130" type="checkbox" ><label for="sk-estimator-id-130" class="sk-toggleable__label fitted sk-toggleable__label-arrow fitted">&nbsp;NuSVR<a class="sk-estimator-doc-link fitted" rel="noreferrer" target="_blank" href="https://scikit-learn.org/1.5/modules/generated/sklearn.svm.NuSVR.html">?<span>Documentation for NuSVR</span></a></label><div class="sk-toggleable__content fitted"><pre>NuSVR()</pre></div> </div></div></div></div></div></div></div></div></div></div></div></div></div></div>
+</style><div id="sk-container-id-43" class="sk-top-container"><div class="sk-text-repr-fallback"><pre>MultiOutputRegressor(estimator=GridSearchCV(cv=4, estimator=BayesianRidge(),
+                                            n_jobs=2,
+                                            param_grid={&#x27;alpha_1&#x27;: [1e-08,
+                                                                    1e-07,
+                                                                    1e-06,
+                                                                    0.0001],
+                                                        &#x27;alpha_2&#x27;: [9.469696969696969,
+                                                                    94.69696969696969,
+                                                                    9469.69696969697],
+                                                        &#x27;lambda_1&#x27;: [1e-06,
+                                                                     0.0001,
+                                                                     0.001],
+                                                        &#x27;lambda_2&#x27;: [7170119605.0,
+                                                                     158551.568,
+                                                                     1585.51568]},
+                                            verbose=1),
+                     n_jobs=2)</pre><b>In a Jupyter environment, please rerun this cell to show the HTML representation or trust the notebook. <br />On GitHub, the HTML representation is unable to render, please try loading this page with nbviewer.org.</b></div><div class="sk-container" hidden><div class="sk-item sk-dashed-wrapped"><div class="sk-label-container"><div class="sk-label fitted sk-toggleable"><input class="sk-toggleable__control sk-hidden--visually" id="sk-estimator-id-70" type="checkbox" ><label for="sk-estimator-id-70" class="sk-toggleable__label fitted sk-toggleable__label-arrow fitted">&nbsp;&nbsp;MultiOutputRegressor<a class="sk-estimator-doc-link fitted" rel="noreferrer" target="_blank" href="https://scikit-learn.org/1.5/modules/generated/sklearn.multioutput.MultiOutputRegressor.html">?<span>Documentation for MultiOutputRegressor</span></a><span class="sk-estimator-doc-link fitted">i<span>Fitted</span></span></label><div class="sk-toggleable__content fitted"><pre>MultiOutputRegressor(estimator=GridSearchCV(cv=4, estimator=BayesianRidge(),
+                                            n_jobs=2,
+                                            param_grid={&#x27;alpha_1&#x27;: [1e-08,
+                                                                    1e-07,
+                                                                    1e-06,
+                                                                    0.0001],
+                                                        &#x27;alpha_2&#x27;: [9.469696969696969,
+                                                                    94.69696969696969,
+                                                                    9469.69696969697],
+                                                        &#x27;lambda_1&#x27;: [1e-06,
+                                                                     0.0001,
+                                                                     0.001],
+                                                        &#x27;lambda_2&#x27;: [7170119605.0,
+                                                                     158551.568,
+                                                                     1585.51568]},
+                                            verbose=1),
+                     n_jobs=2)</pre></div> </div></div><div class="sk-parallel"><div class="sk-parallel-item"><div class="sk-item"><div class="sk-label-container"><div class="sk-label fitted sk-toggleable"><input class="sk-toggleable__control sk-hidden--visually" id="sk-estimator-id-71" type="checkbox" ><label for="sk-estimator-id-71" class="sk-toggleable__label fitted sk-toggleable__label-arrow fitted">estimator: GridSearchCV</label><div class="sk-toggleable__content fitted"><pre>GridSearchCV(cv=4, estimator=BayesianRidge(), n_jobs=2,
+             param_grid={&#x27;alpha_1&#x27;: [1e-08, 1e-07, 1e-06, 0.0001],
+                         &#x27;alpha_2&#x27;: [9.469696969696969, 94.69696969696969,
+                                     9469.69696969697],
+                         &#x27;lambda_1&#x27;: [1e-06, 0.0001, 0.001],
+                         &#x27;lambda_2&#x27;: [7170119605.0, 158551.568, 1585.51568]},
+             verbose=1)</pre></div> </div></div><div class="sk-serial"><div class="sk-item sk-dashed-wrapped"><div class="sk-parallel"><div class="sk-parallel-item"><div class="sk-item"><div class="sk-label-container"><div class="sk-label fitted sk-toggleable"><input class="sk-toggleable__control sk-hidden--visually" id="sk-estimator-id-72" type="checkbox" ><label for="sk-estimator-id-72" class="sk-toggleable__label fitted sk-toggleable__label-arrow fitted">estimator: BayesianRidge</label><div class="sk-toggleable__content fitted"><pre>BayesianRidge()</pre></div> </div></div><div class="sk-serial"><div class="sk-item"><div class="sk-estimator fitted sk-toggleable"><input class="sk-toggleable__control sk-hidden--visually" id="sk-estimator-id-73" type="checkbox" ><label for="sk-estimator-id-73" class="sk-toggleable__label fitted sk-toggleable__label-arrow fitted">&nbsp;BayesianRidge<a class="sk-estimator-doc-link fitted" rel="noreferrer" target="_blank" href="https://scikit-learn.org/1.5/modules/generated/sklearn.linear_model.BayesianRidge.html">?<span>Documentation for BayesianRidge</span></a></label><div class="sk-toggleable__content fitted"><pre>BayesianRidge()</pre></div> </div></div></div></div></div></div></div></div></div></div></div></div></div></div>
 
 
 
@@ -1830,156 +1551,1103 @@ mr.score(X_train, Y_train), mr.score(X_test, Y_test)
 
 
 
-    (0.7528409927367807, 0.5948398836799705)
+    (0.8811606947174901, 0.8978319336355355)
 
 
 
 
 ```python
-[mr.estimators_[i].best_estimator_.epsilon for i in range(len(mr.estimators_))]
+widelag1 = wide_table_all.loc['2021-01-02':'2021-01-04', nusers_columns].reset_index(drop=True).shift(1)
+widelag1.columns = [f"{c}_lag_1" for c in widelag1.columns]
+widelag2 = wide_table_all.loc['2021-01-02':'2021-01-04', nusers_columns].reset_index(drop=True).shift(2)
+widelag2.columns = [f"{c}_lag_2" for c in widelag2.columns]
 ```
 
 
+```python
+def predict_with_synth_and_lags(synth_full, widelag1, widelag2, nusers_columns):
+    predictions = []
+    lag1 = widelag1.copy().reindex(range(len(synth_full))).fillna(0)
+    lag2 = widelag2.copy().reindex(range(len(synth_full))).fillna(0)
+    for col in synth_full.columns:
+        if 'nusers' in col:
+            synth_full[col] = synth_full[col].apply(np.square)
+
+    for i in range(2, len(synth_full)):
+        base_features = synth_full.iloc[i]
+        lag1_features = lag1.iloc[i]
+        lag2_features = lag2.iloc[i]
+        base_row = pd.concat([base_features, lag1_features, lag2_features]).to_frame().T
+        input_row = base_row[nusers_lag_columns]
+        y_pred = mr.predict(input_row)[0]
+        predictions.append(y_pred)
+
+        if i + 1 < len(synth_full):
+            lag2.iloc[i + 1] = lag1.iloc[i]
+            lag1.iloc[i + 1] = y_pred
+
+    predictions_df = pd.DataFrame(predictions, columns=nusers_columns)
+    return predictions_df
+
+nusers_predictions = predict_with_synth_and_lags(synth_full, widelag1, widelag2, nusers_columns)
+```
 
 
-    [10.0,
-     0.00046415888336127535,
-     0.00046415888336127535,
-     10.0,
-     0.00046415888336127535,
-     0.00046415888336127535,
-     2.154434690031878e-08,
-     0.00046415888336127535,
-     0.00046415888336127535,
-     2.154434690031878e-08,
-     1e-25,
-     2.154434690031878e-08,
-     1e-12,
-     0.00046415888336127535,
-     1e-25]
+```python
+combined_synth = synth_full.iloc[2:].reset_index(drop=True).join(nusers_predictions)
+```
+
+
+```python
+n_columns = [c for c in wide_subset.columns if '_n' in c and 'nusers' not in c and 'suspended' not in c and 'not' not in c and 'lag' not in c]
+n_lag_columns = [c for c in combined_synth.columns if c not in n_columns]
+
+X = wide_subset[n_lag_columns]
+Y = wide_subset[n_columns]
+
+X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=0.2, random_state=3)
+params = {
+    'alpha_1': [1e-10, 1e-6, 1e-3],
+    'alpha_2': [3.736346e-2, 1e-6/3.736346e-8, 5e-6/1.056e-8, 1e-3/5.802289e-8, 5e-2/5.802289e-8],
+    'lambda_1': [1e-6, 5e-1, 2],
+    'lambda_2': [0.104153, 0.535613, 2.706002, 6.359122, 550.777346],
+}
+br = BayesianRidge()
+grid_search = GridSearchCV(br, params, cv=3, n_jobs=3, verbose=1)
+mr = MultiOutputRegressor(grid_search, n_jobs=2)
+mr.fit(X_train, Y_train)
+```
+
+    Fitting 3 folds for each of 225 candidates, totalling 675 fits
+    Fitting 3 folds for each of 225 candidates, totalling 675 fits
+    Fitting 3 folds for each of 225 candidates, totalling 675 fits
+    Fitting 3 folds for each of 225 candidates, totalling 675 fits
+    Fitting 3 folds for each of 225 candidates, totalling 675 fits
+    Fitting 3 folds for each of 225 candidates, totalling 675 fits
+    Fitting 3 folds for each of 225 candidates, totalling 675 fits
+    Fitting 3 folds for each of 225 candidates, totalling 675 fits
+    Fitting 3 folds for each of 225 candidates, totalling 675 fits
+    Fitting 3 folds for each of 225 candidates, totalling 675 fits
+    Fitting 3 folds for each of 225 candidates, totalling 675 fits
+    Fitting 3 folds for each of 225 candidates, totalling 675 fits
+
+
+
+
+
+<style>#sk-container-id-83 {
+  /* Definition of color scheme common for light and dark mode */
+  --sklearn-color-text: black;
+  --sklearn-color-line: gray;
+  /* Definition of color scheme for unfitted estimators */
+  --sklearn-color-unfitted-level-0: #fff5e6;
+  --sklearn-color-unfitted-level-1: #f6e4d2;
+  --sklearn-color-unfitted-level-2: #ffe0b3;
+  --sklearn-color-unfitted-level-3: chocolate;
+  /* Definition of color scheme for fitted estimators */
+  --sklearn-color-fitted-level-0: #f0f8ff;
+  --sklearn-color-fitted-level-1: #d4ebff;
+  --sklearn-color-fitted-level-2: #b3dbfd;
+  --sklearn-color-fitted-level-3: cornflowerblue;
+
+  /* Specific color for light theme */
+  --sklearn-color-text-on-default-background: var(--sg-text-color, var(--theme-code-foreground, var(--jp-content-font-color1, black)));
+  --sklearn-color-background: var(--sg-background-color, var(--theme-background, var(--jp-layout-color0, white)));
+  --sklearn-color-border-box: var(--sg-text-color, var(--theme-code-foreground, var(--jp-content-font-color1, black)));
+  --sklearn-color-icon: #696969;
+
+  @media (prefers-color-scheme: dark) {
+    /* Redefinition of color scheme for dark theme */
+    --sklearn-color-text-on-default-background: var(--sg-text-color, var(--theme-code-foreground, var(--jp-content-font-color1, white)));
+    --sklearn-color-background: var(--sg-background-color, var(--theme-background, var(--jp-layout-color0, #111)));
+    --sklearn-color-border-box: var(--sg-text-color, var(--theme-code-foreground, var(--jp-content-font-color1, white)));
+    --sklearn-color-icon: #878787;
+  }
+}
+
+#sk-container-id-83 {
+  color: var(--sklearn-color-text);
+}
+
+#sk-container-id-83 pre {
+  padding: 0;
+}
+
+#sk-container-id-83 input.sk-hidden--visually {
+  border: 0;
+  clip: rect(1px 1px 1px 1px);
+  clip: rect(1px, 1px, 1px, 1px);
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  padding: 0;
+  position: absolute;
+  width: 1px;
+}
+
+#sk-container-id-83 div.sk-dashed-wrapped {
+  border: 1px dashed var(--sklearn-color-line);
+  margin: 0 0.4em 0.5em 0.4em;
+  box-sizing: border-box;
+  padding-bottom: 0.4em;
+  background-color: var(--sklearn-color-background);
+}
+
+#sk-container-id-83 div.sk-container {
+  /* jupyter's `normalize.less` sets `[hidden] { display: none; }`
+     but bootstrap.min.css set `[hidden] { display: none !important; }`
+     so we also need the `!important` here to be able to override the
+     default hidden behavior on the sphinx rendered scikit-learn.org.
+     See: https://github.com/scikit-learn/scikit-learn/issues/21755 */
+  display: inline-block !important;
+  position: relative;
+}
+
+#sk-container-id-83 div.sk-text-repr-fallback {
+  display: none;
+}
+
+div.sk-parallel-item,
+div.sk-serial,
+div.sk-item {
+  /* draw centered vertical line to link estimators */
+  background-image: linear-gradient(var(--sklearn-color-text-on-default-background), var(--sklearn-color-text-on-default-background));
+  background-size: 2px 100%;
+  background-repeat: no-repeat;
+  background-position: center center;
+}
+
+/* Parallel-specific style estimator block */
+
+#sk-container-id-83 div.sk-parallel-item::after {
+  content: "";
+  width: 100%;
+  border-bottom: 2px solid var(--sklearn-color-text-on-default-background);
+  flex-grow: 1;
+}
+
+#sk-container-id-83 div.sk-parallel {
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  background-color: var(--sklearn-color-background);
+  position: relative;
+}
+
+#sk-container-id-83 div.sk-parallel-item {
+  display: flex;
+  flex-direction: column;
+}
+
+#sk-container-id-83 div.sk-parallel-item:first-child::after {
+  align-self: flex-end;
+  width: 50%;
+}
+
+#sk-container-id-83 div.sk-parallel-item:last-child::after {
+  align-self: flex-start;
+  width: 50%;
+}
+
+#sk-container-id-83 div.sk-parallel-item:only-child::after {
+  width: 0;
+}
+
+/* Serial-specific style estimator block */
+
+#sk-container-id-83 div.sk-serial {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  background-color: var(--sklearn-color-background);
+  padding-right: 1em;
+  padding-left: 1em;
+}
+
+
+/* Toggleable style: style used for estimator/Pipeline/ColumnTransformer box that is
+clickable and can be expanded/collapsed.
+- Pipeline and ColumnTransformer use this feature and define the default style
+- Estimators will overwrite some part of the style using the `sk-estimator` class
+*/
+
+/* Pipeline and ColumnTransformer style (default) */
+
+#sk-container-id-83 div.sk-toggleable {
+  /* Default theme specific background. It is overwritten whether we have a
+  specific estimator or a Pipeline/ColumnTransformer */
+  background-color: var(--sklearn-color-background);
+}
+
+/* Toggleable label */
+#sk-container-id-83 label.sk-toggleable__label {
+  cursor: pointer;
+  display: block;
+  width: 100%;
+  margin-bottom: 0;
+  padding: 0.5em;
+  box-sizing: border-box;
+  text-align: center;
+}
+
+#sk-container-id-83 label.sk-toggleable__label-arrow:before {
+  /* Arrow on the left of the label */
+  content: "▸";
+  float: left;
+  margin-right: 0.25em;
+  color: var(--sklearn-color-icon);
+}
+
+#sk-container-id-83 label.sk-toggleable__label-arrow:hover:before {
+  color: var(--sklearn-color-text);
+}
+
+/* Toggleable content - dropdown */
+
+#sk-container-id-83 div.sk-toggleable__content {
+  max-height: 0;
+  max-width: 0;
+  overflow: hidden;
+  text-align: left;
+  /* unfitted */
+  background-color: var(--sklearn-color-unfitted-level-0);
+}
+
+#sk-container-id-83 div.sk-toggleable__content.fitted {
+  /* fitted */
+  background-color: var(--sklearn-color-fitted-level-0);
+}
+
+#sk-container-id-83 div.sk-toggleable__content pre {
+  margin: 0.2em;
+  border-radius: 0.25em;
+  color: var(--sklearn-color-text);
+  /* unfitted */
+  background-color: var(--sklearn-color-unfitted-level-0);
+}
+
+#sk-container-id-83 div.sk-toggleable__content.fitted pre {
+  /* unfitted */
+  background-color: var(--sklearn-color-fitted-level-0);
+}
+
+#sk-container-id-83 input.sk-toggleable__control:checked~div.sk-toggleable__content {
+  /* Expand drop-down */
+  max-height: 200px;
+  max-width: 100%;
+  overflow: auto;
+}
+
+#sk-container-id-83 input.sk-toggleable__control:checked~label.sk-toggleable__label-arrow:before {
+  content: "▾";
+}
+
+/* Pipeline/ColumnTransformer-specific style */
+
+#sk-container-id-83 div.sk-label input.sk-toggleable__control:checked~label.sk-toggleable__label {
+  color: var(--sklearn-color-text);
+  background-color: var(--sklearn-color-unfitted-level-2);
+}
+
+#sk-container-id-83 div.sk-label.fitted input.sk-toggleable__control:checked~label.sk-toggleable__label {
+  background-color: var(--sklearn-color-fitted-level-2);
+}
+
+/* Estimator-specific style */
+
+/* Colorize estimator box */
+#sk-container-id-83 div.sk-estimator input.sk-toggleable__control:checked~label.sk-toggleable__label {
+  /* unfitted */
+  background-color: var(--sklearn-color-unfitted-level-2);
+}
+
+#sk-container-id-83 div.sk-estimator.fitted input.sk-toggleable__control:checked~label.sk-toggleable__label {
+  /* fitted */
+  background-color: var(--sklearn-color-fitted-level-2);
+}
+
+#sk-container-id-83 div.sk-label label.sk-toggleable__label,
+#sk-container-id-83 div.sk-label label {
+  /* The background is the default theme color */
+  color: var(--sklearn-color-text-on-default-background);
+}
+
+/* On hover, darken the color of the background */
+#sk-container-id-83 div.sk-label:hover label.sk-toggleable__label {
+  color: var(--sklearn-color-text);
+  background-color: var(--sklearn-color-unfitted-level-2);
+}
+
+/* Label box, darken color on hover, fitted */
+#sk-container-id-83 div.sk-label.fitted:hover label.sk-toggleable__label.fitted {
+  color: var(--sklearn-color-text);
+  background-color: var(--sklearn-color-fitted-level-2);
+}
+
+/* Estimator label */
+
+#sk-container-id-83 div.sk-label label {
+  font-family: monospace;
+  font-weight: bold;
+  display: inline-block;
+  line-height: 1.2em;
+}
+
+#sk-container-id-83 div.sk-label-container {
+  text-align: center;
+}
+
+/* Estimator-specific */
+#sk-container-id-83 div.sk-estimator {
+  font-family: monospace;
+  border: 1px dotted var(--sklearn-color-border-box);
+  border-radius: 0.25em;
+  box-sizing: border-box;
+  margin-bottom: 0.5em;
+  /* unfitted */
+  background-color: var(--sklearn-color-unfitted-level-0);
+}
+
+#sk-container-id-83 div.sk-estimator.fitted {
+  /* fitted */
+  background-color: var(--sklearn-color-fitted-level-0);
+}
+
+/* on hover */
+#sk-container-id-83 div.sk-estimator:hover {
+  /* unfitted */
+  background-color: var(--sklearn-color-unfitted-level-2);
+}
+
+#sk-container-id-83 div.sk-estimator.fitted:hover {
+  /* fitted */
+  background-color: var(--sklearn-color-fitted-level-2);
+}
+
+/* Specification for estimator info (e.g. "i" and "?") */
+
+/* Common style for "i" and "?" */
+
+.sk-estimator-doc-link,
+a:link.sk-estimator-doc-link,
+a:visited.sk-estimator-doc-link {
+  float: right;
+  font-size: smaller;
+  line-height: 1em;
+  font-family: monospace;
+  background-color: var(--sklearn-color-background);
+  border-radius: 1em;
+  height: 1em;
+  width: 1em;
+  text-decoration: none !important;
+  margin-left: 1ex;
+  /* unfitted */
+  border: var(--sklearn-color-unfitted-level-1) 1pt solid;
+  color: var(--sklearn-color-unfitted-level-1);
+}
+
+.sk-estimator-doc-link.fitted,
+a:link.sk-estimator-doc-link.fitted,
+a:visited.sk-estimator-doc-link.fitted {
+  /* fitted */
+  border: var(--sklearn-color-fitted-level-1) 1pt solid;
+  color: var(--sklearn-color-fitted-level-1);
+}
+
+/* On hover */
+div.sk-estimator:hover .sk-estimator-doc-link:hover,
+.sk-estimator-doc-link:hover,
+div.sk-label-container:hover .sk-estimator-doc-link:hover,
+.sk-estimator-doc-link:hover {
+  /* unfitted */
+  background-color: var(--sklearn-color-unfitted-level-3);
+  color: var(--sklearn-color-background);
+  text-decoration: none;
+}
+
+div.sk-estimator.fitted:hover .sk-estimator-doc-link.fitted:hover,
+.sk-estimator-doc-link.fitted:hover,
+div.sk-label-container:hover .sk-estimator-doc-link.fitted:hover,
+.sk-estimator-doc-link.fitted:hover {
+  /* fitted */
+  background-color: var(--sklearn-color-fitted-level-3);
+  color: var(--sklearn-color-background);
+  text-decoration: none;
+}
+
+/* Span, style for the box shown on hovering the info icon */
+.sk-estimator-doc-link span {
+  display: none;
+  z-index: 9999;
+  position: relative;
+  font-weight: normal;
+  right: .2ex;
+  padding: .5ex;
+  margin: .5ex;
+  width: min-content;
+  min-width: 20ex;
+  max-width: 50ex;
+  color: var(--sklearn-color-text);
+  box-shadow: 2pt 2pt 4pt #999;
+  /* unfitted */
+  background: var(--sklearn-color-unfitted-level-0);
+  border: .5pt solid var(--sklearn-color-unfitted-level-3);
+}
+
+.sk-estimator-doc-link.fitted span {
+  /* fitted */
+  background: var(--sklearn-color-fitted-level-0);
+  border: var(--sklearn-color-fitted-level-3);
+}
+
+.sk-estimator-doc-link:hover span {
+  display: block;
+}
+
+/* "?"-specific style due to the `<a>` HTML tag */
+
+#sk-container-id-83 a.estimator_doc_link {
+  float: right;
+  font-size: 1rem;
+  line-height: 1em;
+  font-family: monospace;
+  background-color: var(--sklearn-color-background);
+  border-radius: 1rem;
+  height: 1rem;
+  width: 1rem;
+  text-decoration: none;
+  /* unfitted */
+  color: var(--sklearn-color-unfitted-level-1);
+  border: var(--sklearn-color-unfitted-level-1) 1pt solid;
+}
+
+#sk-container-id-83 a.estimator_doc_link.fitted {
+  /* fitted */
+  border: var(--sklearn-color-fitted-level-1) 1pt solid;
+  color: var(--sklearn-color-fitted-level-1);
+}
+
+/* On hover */
+#sk-container-id-83 a.estimator_doc_link:hover {
+  /* unfitted */
+  background-color: var(--sklearn-color-unfitted-level-3);
+  color: var(--sklearn-color-background);
+  text-decoration: none;
+}
+
+#sk-container-id-83 a.estimator_doc_link.fitted:hover {
+  /* fitted */
+  background-color: var(--sklearn-color-fitted-level-3);
+}
+</style><div id="sk-container-id-83" class="sk-top-container"><div class="sk-text-repr-fallback"><pre>MultiOutputRegressor(estimator=GridSearchCV(cv=3, estimator=BayesianRidge(),
+                                            n_jobs=3,
+                                            param_grid={&#x27;alpha_1&#x27;: [1e-10,
+                                                                    1e-06,
+                                                                    0.001],
+                                                        &#x27;alpha_2&#x27;: [0.03736346,
+                                                                    26.76411659947981,
+                                                                    473.4848484848485,
+                                                                    17234.577595152536,
+                                                                    861728.8797576267],
+                                                        &#x27;lambda_1&#x27;: [1e-06, 0.5,
+                                                                     2],
+                                                        &#x27;lambda_2&#x27;: [0.104153,
+                                                                     0.535613,
+                                                                     2.706002,
+                                                                     6.359122,
+                                                                     550.777346]},
+                                            verbose=1),
+                     n_jobs=2)</pre><b>In a Jupyter environment, please rerun this cell to show the HTML representation or trust the notebook. <br />On GitHub, the HTML representation is unable to render, please try loading this page with nbviewer.org.</b></div><div class="sk-container" hidden><div class="sk-item sk-dashed-wrapped"><div class="sk-label-container"><div class="sk-label fitted sk-toggleable"><input class="sk-toggleable__control sk-hidden--visually" id="sk-estimator-id-146" type="checkbox" ><label for="sk-estimator-id-146" class="sk-toggleable__label fitted sk-toggleable__label-arrow fitted">&nbsp;&nbsp;MultiOutputRegressor<a class="sk-estimator-doc-link fitted" rel="noreferrer" target="_blank" href="https://scikit-learn.org/1.5/modules/generated/sklearn.multioutput.MultiOutputRegressor.html">?<span>Documentation for MultiOutputRegressor</span></a><span class="sk-estimator-doc-link fitted">i<span>Fitted</span></span></label><div class="sk-toggleable__content fitted"><pre>MultiOutputRegressor(estimator=GridSearchCV(cv=3, estimator=BayesianRidge(),
+                                            n_jobs=3,
+                                            param_grid={&#x27;alpha_1&#x27;: [1e-10,
+                                                                    1e-06,
+                                                                    0.001],
+                                                        &#x27;alpha_2&#x27;: [0.03736346,
+                                                                    26.76411659947981,
+                                                                    473.4848484848485,
+                                                                    17234.577595152536,
+                                                                    861728.8797576267],
+                                                        &#x27;lambda_1&#x27;: [1e-06, 0.5,
+                                                                     2],
+                                                        &#x27;lambda_2&#x27;: [0.104153,
+                                                                     0.535613,
+                                                                     2.706002,
+                                                                     6.359122,
+                                                                     550.777346]},
+                                            verbose=1),
+                     n_jobs=2)</pre></div> </div></div><div class="sk-parallel"><div class="sk-parallel-item"><div class="sk-item"><div class="sk-label-container"><div class="sk-label fitted sk-toggleable"><input class="sk-toggleable__control sk-hidden--visually" id="sk-estimator-id-147" type="checkbox" ><label for="sk-estimator-id-147" class="sk-toggleable__label fitted sk-toggleable__label-arrow fitted">estimator: GridSearchCV</label><div class="sk-toggleable__content fitted"><pre>GridSearchCV(cv=3, estimator=BayesianRidge(), n_jobs=3,
+             param_grid={&#x27;alpha_1&#x27;: [1e-10, 1e-06, 0.001],
+                         &#x27;alpha_2&#x27;: [0.03736346, 26.76411659947981,
+                                     473.4848484848485, 17234.577595152536,
+                                     861728.8797576267],
+                         &#x27;lambda_1&#x27;: [1e-06, 0.5, 2],
+                         &#x27;lambda_2&#x27;: [0.104153, 0.535613, 2.706002, 6.359122,
+                                      550.777346]},
+             verbose=1)</pre></div> </div></div><div class="sk-serial"><div class="sk-item sk-dashed-wrapped"><div class="sk-parallel"><div class="sk-parallel-item"><div class="sk-item"><div class="sk-label-container"><div class="sk-label fitted sk-toggleable"><input class="sk-toggleable__control sk-hidden--visually" id="sk-estimator-id-148" type="checkbox" ><label for="sk-estimator-id-148" class="sk-toggleable__label fitted sk-toggleable__label-arrow fitted">estimator: BayesianRidge</label><div class="sk-toggleable__content fitted"><pre>BayesianRidge()</pre></div> </div></div><div class="sk-serial"><div class="sk-item"><div class="sk-estimator fitted sk-toggleable"><input class="sk-toggleable__control sk-hidden--visually" id="sk-estimator-id-149" type="checkbox" ><label for="sk-estimator-id-149" class="sk-toggleable__label fitted sk-toggleable__label-arrow fitted">&nbsp;BayesianRidge<a class="sk-estimator-doc-link fitted" rel="noreferrer" target="_blank" href="https://scikit-learn.org/1.5/modules/generated/sklearn.linear_model.BayesianRidge.html">?<span>Documentation for BayesianRidge</span></a></label><div class="sk-toggleable__content fitted"><pre>BayesianRidge()</pre></div> </div></div></div></div></div></div></div></div></div></div></div></div></div></div>
 
 
 
 
 ```python
-synth = synthetic.copy()
-synth['suspended_ha_n'] = synth['sus_ha_nusers'] / synth['sus_ha_n']
-synth['suspended_ma_n'] = synth['sus_ma_nusers'] / synth['sus_ma_n']
-synth['suspended_la_n'] = synth['sus_la_nusers'] / synth['sus_la_n']
-synth.columns = [c.replace('sus_', 'suspended_') if c.endswith('_nusers') else c for c in synth.columns]
-synth_lag1 = synth.shift(1)
-synth_lag2 = synth.shift(2)
-synth_lag1.columns = [f"{col}_lag_1" for col in synth_lag1.columns]
-synth_lag2.columns = [f"{col}_lag_2" for col in synth_lag2.columns]
-synthet = synth.join(synth_lag1).join(synth_lag2).iloc[7:].reset_index(drop=True)[[c for c in synth.columns if not c.startswith('sus_')]]
-scaler = StandardScaler()
-synthet_standard = scaler.fit_transform(synthet)
-synthe = pd.DataFrame(synthet_standard, columns=synthet.columns)
+mr.score(X_train, Y_train), mr.score(X_test, Y_test)
+```
+
+
+
+
+    (0.9445085933228046, 0.9217655018678427)
+
+
+
+
+```python
+n_predictions = pd.DataFrame(mr.predict(combined_synth[n_lag_columns]), columns=n_columns)
+comb_synth = pd.concat([combined_synth, n_predictions], axis=1)
+```
+
+### Modeling Fake Content
+
+
+```python
+input_features = comb_synth.columns
+output_features = [c for c in wide_subset.columns if c.endswith('_fm')]
 ```
 
 
 ```python
-series = standardized_df[[c for c in X_.columns]].iloc[-1:].reset_index(drop=True)
-full_synth = pd.concat([synthe, series[[c for c in series.columns if c not in suspended_columns]]], axis=1)
+X = wide_subset[input_features]
+Y = wide_subset[output_features].sum(axis=1)
+
+X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=0.25, random_state=400)
+
+params = {
+    'alpha_1': [1e-8, 1e-6, 1e-4],
+    'alpha_2': [2.20083397e-7, 2.20083397e-5, 2.20083397e-3],
+    'lambda_1': [1e-4, 5e-3, 5e-2, 1e-2],
+    'lambda_2': [3.93618954e-9, 3.93618954e-7, 3.93618954e-5],
+}
+
+br = BayesianRidge()
+grid = GridSearchCV(br, params, cv=4, n_jobs=2, verbose=1)
+grid.fit(X_train, Y_train)
+```
+
+    Fitting 4 folds for each of 108 candidates, totalling 432 fits
+
+
+
+
+
+<style>#sk-container-id-144 {
+  /* Definition of color scheme common for light and dark mode */
+  --sklearn-color-text: black;
+  --sklearn-color-line: gray;
+  /* Definition of color scheme for unfitted estimators */
+  --sklearn-color-unfitted-level-0: #fff5e6;
+  --sklearn-color-unfitted-level-1: #f6e4d2;
+  --sklearn-color-unfitted-level-2: #ffe0b3;
+  --sklearn-color-unfitted-level-3: chocolate;
+  /* Definition of color scheme for fitted estimators */
+  --sklearn-color-fitted-level-0: #f0f8ff;
+  --sklearn-color-fitted-level-1: #d4ebff;
+  --sklearn-color-fitted-level-2: #b3dbfd;
+  --sklearn-color-fitted-level-3: cornflowerblue;
+
+  /* Specific color for light theme */
+  --sklearn-color-text-on-default-background: var(--sg-text-color, var(--theme-code-foreground, var(--jp-content-font-color1, black)));
+  --sklearn-color-background: var(--sg-background-color, var(--theme-background, var(--jp-layout-color0, white)));
+  --sklearn-color-border-box: var(--sg-text-color, var(--theme-code-foreground, var(--jp-content-font-color1, black)));
+  --sklearn-color-icon: #696969;
+
+  @media (prefers-color-scheme: dark) {
+    /* Redefinition of color scheme for dark theme */
+    --sklearn-color-text-on-default-background: var(--sg-text-color, var(--theme-code-foreground, var(--jp-content-font-color1, white)));
+    --sklearn-color-background: var(--sg-background-color, var(--theme-background, var(--jp-layout-color0, #111)));
+    --sklearn-color-border-box: var(--sg-text-color, var(--theme-code-foreground, var(--jp-content-font-color1, white)));
+    --sklearn-color-icon: #878787;
+  }
+}
+
+#sk-container-id-144 {
+  color: var(--sklearn-color-text);
+}
+
+#sk-container-id-144 pre {
+  padding: 0;
+}
+
+#sk-container-id-144 input.sk-hidden--visually {
+  border: 0;
+  clip: rect(1px 1px 1px 1px);
+  clip: rect(1px, 1px, 1px, 1px);
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  padding: 0;
+  position: absolute;
+  width: 1px;
+}
+
+#sk-container-id-144 div.sk-dashed-wrapped {
+  border: 1px dashed var(--sklearn-color-line);
+  margin: 0 0.4em 0.5em 0.4em;
+  box-sizing: border-box;
+  padding-bottom: 0.4em;
+  background-color: var(--sklearn-color-background);
+}
+
+#sk-container-id-144 div.sk-container {
+  /* jupyter's `normalize.less` sets `[hidden] { display: none; }`
+     but bootstrap.min.css set `[hidden] { display: none !important; }`
+     so we also need the `!important` here to be able to override the
+     default hidden behavior on the sphinx rendered scikit-learn.org.
+     See: https://github.com/scikit-learn/scikit-learn/issues/21755 */
+  display: inline-block !important;
+  position: relative;
+}
+
+#sk-container-id-144 div.sk-text-repr-fallback {
+  display: none;
+}
+
+div.sk-parallel-item,
+div.sk-serial,
+div.sk-item {
+  /* draw centered vertical line to link estimators */
+  background-image: linear-gradient(var(--sklearn-color-text-on-default-background), var(--sklearn-color-text-on-default-background));
+  background-size: 2px 100%;
+  background-repeat: no-repeat;
+  background-position: center center;
+}
+
+/* Parallel-specific style estimator block */
+
+#sk-container-id-144 div.sk-parallel-item::after {
+  content: "";
+  width: 100%;
+  border-bottom: 2px solid var(--sklearn-color-text-on-default-background);
+  flex-grow: 1;
+}
+
+#sk-container-id-144 div.sk-parallel {
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  background-color: var(--sklearn-color-background);
+  position: relative;
+}
+
+#sk-container-id-144 div.sk-parallel-item {
+  display: flex;
+  flex-direction: column;
+}
+
+#sk-container-id-144 div.sk-parallel-item:first-child::after {
+  align-self: flex-end;
+  width: 50%;
+}
+
+#sk-container-id-144 div.sk-parallel-item:last-child::after {
+  align-self: flex-start;
+  width: 50%;
+}
+
+#sk-container-id-144 div.sk-parallel-item:only-child::after {
+  width: 0;
+}
+
+/* Serial-specific style estimator block */
+
+#sk-container-id-144 div.sk-serial {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  background-color: var(--sklearn-color-background);
+  padding-right: 1em;
+  padding-left: 1em;
+}
+
+
+/* Toggleable style: style used for estimator/Pipeline/ColumnTransformer box that is
+clickable and can be expanded/collapsed.
+- Pipeline and ColumnTransformer use this feature and define the default style
+- Estimators will overwrite some part of the style using the `sk-estimator` class
+*/
+
+/* Pipeline and ColumnTransformer style (default) */
+
+#sk-container-id-144 div.sk-toggleable {
+  /* Default theme specific background. It is overwritten whether we have a
+  specific estimator or a Pipeline/ColumnTransformer */
+  background-color: var(--sklearn-color-background);
+}
+
+/* Toggleable label */
+#sk-container-id-144 label.sk-toggleable__label {
+  cursor: pointer;
+  display: block;
+  width: 100%;
+  margin-bottom: 0;
+  padding: 0.5em;
+  box-sizing: border-box;
+  text-align: center;
+}
+
+#sk-container-id-144 label.sk-toggleable__label-arrow:before {
+  /* Arrow on the left of the label */
+  content: "▸";
+  float: left;
+  margin-right: 0.25em;
+  color: var(--sklearn-color-icon);
+}
+
+#sk-container-id-144 label.sk-toggleable__label-arrow:hover:before {
+  color: var(--sklearn-color-text);
+}
+
+/* Toggleable content - dropdown */
+
+#sk-container-id-144 div.sk-toggleable__content {
+  max-height: 0;
+  max-width: 0;
+  overflow: hidden;
+  text-align: left;
+  /* unfitted */
+  background-color: var(--sklearn-color-unfitted-level-0);
+}
+
+#sk-container-id-144 div.sk-toggleable__content.fitted {
+  /* fitted */
+  background-color: var(--sklearn-color-fitted-level-0);
+}
+
+#sk-container-id-144 div.sk-toggleable__content pre {
+  margin: 0.2em;
+  border-radius: 0.25em;
+  color: var(--sklearn-color-text);
+  /* unfitted */
+  background-color: var(--sklearn-color-unfitted-level-0);
+}
+
+#sk-container-id-144 div.sk-toggleable__content.fitted pre {
+  /* unfitted */
+  background-color: var(--sklearn-color-fitted-level-0);
+}
+
+#sk-container-id-144 input.sk-toggleable__control:checked~div.sk-toggleable__content {
+  /* Expand drop-down */
+  max-height: 200px;
+  max-width: 100%;
+  overflow: auto;
+}
+
+#sk-container-id-144 input.sk-toggleable__control:checked~label.sk-toggleable__label-arrow:before {
+  content: "▾";
+}
+
+/* Pipeline/ColumnTransformer-specific style */
+
+#sk-container-id-144 div.sk-label input.sk-toggleable__control:checked~label.sk-toggleable__label {
+  color: var(--sklearn-color-text);
+  background-color: var(--sklearn-color-unfitted-level-2);
+}
+
+#sk-container-id-144 div.sk-label.fitted input.sk-toggleable__control:checked~label.sk-toggleable__label {
+  background-color: var(--sklearn-color-fitted-level-2);
+}
+
+/* Estimator-specific style */
+
+/* Colorize estimator box */
+#sk-container-id-144 div.sk-estimator input.sk-toggleable__control:checked~label.sk-toggleable__label {
+  /* unfitted */
+  background-color: var(--sklearn-color-unfitted-level-2);
+}
+
+#sk-container-id-144 div.sk-estimator.fitted input.sk-toggleable__control:checked~label.sk-toggleable__label {
+  /* fitted */
+  background-color: var(--sklearn-color-fitted-level-2);
+}
+
+#sk-container-id-144 div.sk-label label.sk-toggleable__label,
+#sk-container-id-144 div.sk-label label {
+  /* The background is the default theme color */
+  color: var(--sklearn-color-text-on-default-background);
+}
+
+/* On hover, darken the color of the background */
+#sk-container-id-144 div.sk-label:hover label.sk-toggleable__label {
+  color: var(--sklearn-color-text);
+  background-color: var(--sklearn-color-unfitted-level-2);
+}
+
+/* Label box, darken color on hover, fitted */
+#sk-container-id-144 div.sk-label.fitted:hover label.sk-toggleable__label.fitted {
+  color: var(--sklearn-color-text);
+  background-color: var(--sklearn-color-fitted-level-2);
+}
+
+/* Estimator label */
+
+#sk-container-id-144 div.sk-label label {
+  font-family: monospace;
+  font-weight: bold;
+  display: inline-block;
+  line-height: 1.2em;
+}
+
+#sk-container-id-144 div.sk-label-container {
+  text-align: center;
+}
+
+/* Estimator-specific */
+#sk-container-id-144 div.sk-estimator {
+  font-family: monospace;
+  border: 1px dotted var(--sklearn-color-border-box);
+  border-radius: 0.25em;
+  box-sizing: border-box;
+  margin-bottom: 0.5em;
+  /* unfitted */
+  background-color: var(--sklearn-color-unfitted-level-0);
+}
+
+#sk-container-id-144 div.sk-estimator.fitted {
+  /* fitted */
+  background-color: var(--sklearn-color-fitted-level-0);
+}
+
+/* on hover */
+#sk-container-id-144 div.sk-estimator:hover {
+  /* unfitted */
+  background-color: var(--sklearn-color-unfitted-level-2);
+}
+
+#sk-container-id-144 div.sk-estimator.fitted:hover {
+  /* fitted */
+  background-color: var(--sklearn-color-fitted-level-2);
+}
+
+/* Specification for estimator info (e.g. "i" and "?") */
+
+/* Common style for "i" and "?" */
+
+.sk-estimator-doc-link,
+a:link.sk-estimator-doc-link,
+a:visited.sk-estimator-doc-link {
+  float: right;
+  font-size: smaller;
+  line-height: 1em;
+  font-family: monospace;
+  background-color: var(--sklearn-color-background);
+  border-radius: 1em;
+  height: 1em;
+  width: 1em;
+  text-decoration: none !important;
+  margin-left: 1ex;
+  /* unfitted */
+  border: var(--sklearn-color-unfitted-level-1) 1pt solid;
+  color: var(--sklearn-color-unfitted-level-1);
+}
+
+.sk-estimator-doc-link.fitted,
+a:link.sk-estimator-doc-link.fitted,
+a:visited.sk-estimator-doc-link.fitted {
+  /* fitted */
+  border: var(--sklearn-color-fitted-level-1) 1pt solid;
+  color: var(--sklearn-color-fitted-level-1);
+}
+
+/* On hover */
+div.sk-estimator:hover .sk-estimator-doc-link:hover,
+.sk-estimator-doc-link:hover,
+div.sk-label-container:hover .sk-estimator-doc-link:hover,
+.sk-estimator-doc-link:hover {
+  /* unfitted */
+  background-color: var(--sklearn-color-unfitted-level-3);
+  color: var(--sklearn-color-background);
+  text-decoration: none;
+}
+
+div.sk-estimator.fitted:hover .sk-estimator-doc-link.fitted:hover,
+.sk-estimator-doc-link.fitted:hover,
+div.sk-label-container:hover .sk-estimator-doc-link.fitted:hover,
+.sk-estimator-doc-link.fitted:hover {
+  /* fitted */
+  background-color: var(--sklearn-color-fitted-level-3);
+  color: var(--sklearn-color-background);
+  text-decoration: none;
+}
+
+/* Span, style for the box shown on hovering the info icon */
+.sk-estimator-doc-link span {
+  display: none;
+  z-index: 9999;
+  position: relative;
+  font-weight: normal;
+  right: .2ex;
+  padding: .5ex;
+  margin: .5ex;
+  width: min-content;
+  min-width: 20ex;
+  max-width: 50ex;
+  color: var(--sklearn-color-text);
+  box-shadow: 2pt 2pt 4pt #999;
+  /* unfitted */
+  background: var(--sklearn-color-unfitted-level-0);
+  border: .5pt solid var(--sklearn-color-unfitted-level-3);
+}
+
+.sk-estimator-doc-link.fitted span {
+  /* fitted */
+  background: var(--sklearn-color-fitted-level-0);
+  border: var(--sklearn-color-fitted-level-3);
+}
+
+.sk-estimator-doc-link:hover span {
+  display: block;
+}
+
+/* "?"-specific style due to the `<a>` HTML tag */
+
+#sk-container-id-144 a.estimator_doc_link {
+  float: right;
+  font-size: 1rem;
+  line-height: 1em;
+  font-family: monospace;
+  background-color: var(--sklearn-color-background);
+  border-radius: 1rem;
+  height: 1rem;
+  width: 1rem;
+  text-decoration: none;
+  /* unfitted */
+  color: var(--sklearn-color-unfitted-level-1);
+  border: var(--sklearn-color-unfitted-level-1) 1pt solid;
+}
+
+#sk-container-id-144 a.estimator_doc_link.fitted {
+  /* fitted */
+  border: var(--sklearn-color-fitted-level-1) 1pt solid;
+  color: var(--sklearn-color-fitted-level-1);
+}
+
+/* On hover */
+#sk-container-id-144 a.estimator_doc_link:hover {
+  /* unfitted */
+  background-color: var(--sklearn-color-unfitted-level-3);
+  color: var(--sklearn-color-background);
+  text-decoration: none;
+}
+
+#sk-container-id-144 a.estimator_doc_link.fitted:hover {
+  /* fitted */
+  background-color: var(--sklearn-color-fitted-level-3);
+}
+</style><div id="sk-container-id-144" class="sk-top-container"><div class="sk-text-repr-fallback"><pre>GridSearchCV(cv=4, estimator=BayesianRidge(), n_jobs=2,
+             param_grid={&#x27;alpha_1&#x27;: [1e-08, 1e-06, 0.0001],
+                         &#x27;alpha_2&#x27;: [2.20083397e-07, 2.20083397e-05,
+                                     0.00220083397],
+                         &#x27;lambda_1&#x27;: [0.0001, 0.005, 0.05, 0.01],
+                         &#x27;lambda_2&#x27;: [3.93618954e-09, 3.93618954e-07,
+                                      3.93618954e-05]},
+             verbose=1)</pre><b>In a Jupyter environment, please rerun this cell to show the HTML representation or trust the notebook. <br />On GitHub, the HTML representation is unable to render, please try loading this page with nbviewer.org.</b></div><div class="sk-container" hidden><div class="sk-item sk-dashed-wrapped"><div class="sk-label-container"><div class="sk-label fitted sk-toggleable"><input class="sk-toggleable__control sk-hidden--visually" id="sk-estimator-id-281" type="checkbox" ><label for="sk-estimator-id-281" class="sk-toggleable__label fitted sk-toggleable__label-arrow fitted">&nbsp;&nbsp;GridSearchCV<a class="sk-estimator-doc-link fitted" rel="noreferrer" target="_blank" href="https://scikit-learn.org/1.5/modules/generated/sklearn.model_selection.GridSearchCV.html">?<span>Documentation for GridSearchCV</span></a><span class="sk-estimator-doc-link fitted">i<span>Fitted</span></span></label><div class="sk-toggleable__content fitted"><pre>GridSearchCV(cv=4, estimator=BayesianRidge(), n_jobs=2,
+             param_grid={&#x27;alpha_1&#x27;: [1e-08, 1e-06, 0.0001],
+                         &#x27;alpha_2&#x27;: [2.20083397e-07, 2.20083397e-05,
+                                     0.00220083397],
+                         &#x27;lambda_1&#x27;: [0.0001, 0.005, 0.05, 0.01],
+                         &#x27;lambda_2&#x27;: [3.93618954e-09, 3.93618954e-07,
+                                      3.93618954e-05]},
+             verbose=1)</pre></div> </div></div><div class="sk-parallel"><div class="sk-parallel-item"><div class="sk-item"><div class="sk-label-container"><div class="sk-label fitted sk-toggleable"><input class="sk-toggleable__control sk-hidden--visually" id="sk-estimator-id-282" type="checkbox" ><label for="sk-estimator-id-282" class="sk-toggleable__label fitted sk-toggleable__label-arrow fitted">best_estimator_: BayesianRidge</label><div class="sk-toggleable__content fitted"><pre>BayesianRidge(alpha_1=0.0001, alpha_2=2.20083397e-07, lambda_1=0.0001,
+              lambda_2=3.93618954e-05)</pre></div> </div></div><div class="sk-serial"><div class="sk-item"><div class="sk-estimator fitted sk-toggleable"><input class="sk-toggleable__control sk-hidden--visually" id="sk-estimator-id-283" type="checkbox" ><label for="sk-estimator-id-283" class="sk-toggleable__label fitted sk-toggleable__label-arrow fitted">&nbsp;BayesianRidge<a class="sk-estimator-doc-link fitted" rel="noreferrer" target="_blank" href="https://scikit-learn.org/1.5/modules/generated/sklearn.linear_model.BayesianRidge.html">?<span>Documentation for BayesianRidge</span></a></label><div class="sk-toggleable__content fitted"><pre>BayesianRidge(alpha_1=0.0001, alpha_2=2.20083397e-07, lambda_1=0.0001,
+              lambda_2=3.93618954e-05)</pre></div> </div></div></div></div></div></div></div></div></div>
+
+
+
+
+```python
+grid.best_estimator_.score(X_train, Y_train), grid.best_estimator_.score(X_test, Y_test)
+```
+
+
+
+
+    (0.8443654769928899, 0.8733435650024223)
+
+
+
+
+```python
+sum_fm_predicted = grid.predict(comb_synth[input_features])
 ```
 
 
 ```python
-lag_2 = [c for c in series.columns if 'lag_2' in c]
-lag_1 = [c for c in series.columns if 'lag_1' in c]
-
-def prepare_row(last_row, row):
-    lag_1_2 = last_row[lag_1]
-    lag_1_ = last_row[[c for c in series.columns if (c not in lag_1) & (c not in lag_2)]]
-    lag_1_2.index = [c.replace('lag_1', 'lag_2') for c in lag_1_2.index]
-    lag_1_.index = [f"{c}_lag_1" for c in lag_1_.index]
-    row_sus = row[suspended_columns]
-    next_row = pd.concat([lag_1_, lag_1_2, row_sus], axis=1)
-    predictions = mr.predict(next_row)
-    y_cols = [c for c in nusers_columns if (c not in nusers_lag_columns) and (c not in suspended_columns)]
-    predictions = pd.DataFrame(predictions, columns=y_cols)
-    full_row = pd.concat([row, predictions], axis=1)
-    return full_row
-prepare_row(full_synth.iloc[-1], full_synth.iloc[0])
+pre_predictions = grid.predict(X)
+pre_predict_real = pd.Series(pre_predictions).to_frame().set_index(X.index)
+pre_predict_real.columns = ['predicted']
+pre_predict_real['actual'] = Y
 ```
 
 
-    ---------------------------------------------------------------------------
-
-    KeyError                                  Traceback (most recent call last)
-
-    Cell In[291], line 16
-         14     full_row = pd.concat([row, predictions], axis=1)
-         15     return full_row
-    ---> 16 prepare_row(full_synth.iloc[-1], full_synth.iloc[0])
+```python
+comb_synth = comb_synth.reset_index(drop=True).set_index(pd.date_range('2021-01-04', periods=152))
+comb_synth['sum_fm_predicted'] = sum_fm_predicted
+```
 
 
-    Cell In[291], line 5, in prepare_row(last_row, row)
-          4 def prepare_row(last_row, row):
-    ----> 5     lag_1_2 = last_row[lag_1]
-          6     lag_1_ = last_row[[c for c in series.columns if (c not in lag_1) & (c not in lag_2)]]
-          7     lag_1_2.index = [c.replace('lag_1', 'lag_2') for c in lag_1_2.index]
+```python
+true_fm = desm.reset_index(drop=True).set_index('date').loc['2021-01-12':, 'fm'].reset_index().groupby('date').sum().rename(columns={'fm': 'actual'})
+joined = true_fm.join(comb_synth['sum_fm_predicted']).reset_index().rename({'sum_fm_predicted': 'predicted'}, axis=1)
+```
 
 
-    File ~/.pyenv/versions/twitter/lib/python3.10/site-packages/pandas/core/series.py:1153, in Series.__getitem__(self, key)
-       1150     key = np.asarray(key, dtype=bool)
-       1151     return self._get_rows_with_mask(key)
-    -> 1153 return self._get_with(key)
+```python
+full_frame = pd.concat([pre_predict_real.reset_index(), joined], axis=0)
+full_frame['treatment'] = (full_frame['date'] >= '2021-01-12').astype(bool)
+```
 
 
-    File ~/.pyenv/versions/twitter/lib/python3.10/site-packages/pandas/core/series.py:1194, in Series._get_with(self, key)
-       1191         return self.iloc[key]
-       1193 # handle the dup indexing case GH#4246
-    -> 1194 return self.loc[key]
+```python
+max(full_frame['actual'])
+```
 
 
-    File ~/.pyenv/versions/twitter/lib/python3.10/site-packages/pandas/core/indexing.py:1191, in _LocationIndexer.__getitem__(self, key)
-       1189 maybe_callable = com.apply_if_callable(key, self.obj)
-       1190 maybe_callable = self._check_deprecated_callable_usage(key, maybe_callable)
-    -> 1191 return self._getitem_axis(maybe_callable, axis=axis)
 
 
-    File ~/.pyenv/versions/twitter/lib/python3.10/site-packages/pandas/core/indexing.py:1420, in _LocIndexer._getitem_axis(self, key, axis)
-       1417     if hasattr(key, "ndim") and key.ndim > 1:
-       1418         raise ValueError("Cannot index with multidimensional key")
-    -> 1420     return self._getitem_iterable(key, axis=axis)
-       1422 # nested tuple slicing
-       1423 if is_nested_tuple(key, labels):
+    17725.0
 
 
-    File ~/.pyenv/versions/twitter/lib/python3.10/site-packages/pandas/core/indexing.py:1360, in _LocIndexer._getitem_iterable(self, key, axis)
-       1357 self._validate_key(key, axis)
-       1359 # A collection of keys
-    -> 1360 keyarr, indexer = self._get_listlike_indexer(key, axis)
-       1361 return self.obj._reindex_with_indexers(
-       1362     {axis: [keyarr, indexer]}, copy=True, allow_dups=True
-       1363 )
 
 
-    File ~/.pyenv/versions/twitter/lib/python3.10/site-packages/pandas/core/indexing.py:1558, in _LocIndexer._get_listlike_indexer(self, key, axis)
-       1555 ax = self.obj._get_axis(axis)
-       1556 axis_name = self.obj._get_axis_name(axis)
-    -> 1558 keyarr, indexer = ax._get_indexer_strict(key, axis_name)
-       1560 return keyarr, indexer
+```python
+from plotnine import *
+```
 
 
-    File ~/.pyenv/versions/twitter/lib/python3.10/site-packages/pandas/core/indexes/base.py:6200, in Index._get_indexer_strict(self, key, axis_name)
-       6197 else:
-       6198     keyarr, indexer, new_indexer = self._reindex_non_unique(keyarr)
-    -> 6200 self._raise_if_missing(keyarr, indexer, axis_name)
-       6202 keyarr = self.take(indexer)
-       6203 if isinstance(key, Index):
-       6204     # GH 42790 - Preserve name from an Index
+```python
+(
+    ggplot(full_frame, aes(x='date'))
+    + geom_point(aes(y='predicted', shape='treatment'), color='blue')
+    + geom_point(aes(y='actual', shape='treatment'), color='green')
+    + theme_bw()
+    + scale_shape_discrete(name='Treatment', labels=['Control', 'Treatment'])
+    + labs(title='Predicted vs Actual Fake Content', subtitle='Before and After User Suspensions', x='Date', y='Total Fake Content')
+    + annotate("rect", xmin=date(2021, 1, 1), xmax=date(2021, 1, 12), ymin=0, ymax=17725, alpha=0.2, fill='blue')
+    + annotate("text", x=date(2021, 1, 6), y=17727, label="Treatment", color='blue', size=8)
+    + theme(figure_size=(10, 5), plot_title=element_text(size=14, hjust=0.5), plot_subtitle=element_text(size=12, hjust=0.5, face='italic'))
+)
+```
 
 
-    File ~/.pyenv/versions/twitter/lib/python3.10/site-packages/pandas/core/indexes/base.py:6252, in Index._raise_if_missing(self, key, indexer, axis_name)
-       6249     raise KeyError(f"None of [{key}] are in the [{axis_name}]")
-       6251 not_found = list(ensure_index(key)[missing_mask.nonzero()[0]].unique())
-    -> 6252 raise KeyError(f"{not_found} not in index")
+    
+![png](cleaned-project-1_files/cleaned-project-1_94_0.png)
+    
 
 
-    KeyError: "['suspended_la_not_fake_sports_lag_1', 'suspended_ha_not_fake_sports_lag_1', 'suspended_ha_not_fake_conservative_lag_1', 'suspended_ma_nusers_lag_1', 'suspended_ma_not_fake_conservative_lag_1', 'suspended_ha_nusers_lag_1', 'suspended_la_nusers_lag_1', 'suspended_la_not_fake_conservative_lag_1', 'suspended_ha_not_fake_liberal_lag_1', 'suspended_la_not_fake_liberal_lag_1', 'suspended_la_n_lag_1', 'suspended_ha_n_lag_1', 'suspended_ma_n_lag_1', 'suspended_ma_not_fake_shopping_lag_1', 'suspended_ha_not_fake_shopping_lag_1', 'suspended_ma_not_fake_sports_lag_1', 'suspended_ma_not_fake_liberal_lag_1', 'suspended_la_not_fake_shopping_lag_1'] not in index"
+In this plot, we can both validate the appropriateness of the model and see the predicted values for the post-treatment period. We can see that the model's predictions follow the observed values closely, even in unusual cases. The gap in the data was intentionally created to avoid biasing the model; the treatment was an ongoing process over a period of 1 week. After the treatment, we can see the synthetic control diverges sharply from the observed values. This result provides another, alternate validation to confirm the success of user suspensions in reducing misinformation.
 
+I think the biggest limitation of the current dataset is that it only collected values based on URLs. Including language data, even simplified, would be a great addition to the dataset. Another limitation is that the values in the dataset are all exogenous. With the aggregation/anonymization of the data, it wouldn't be possible to include many confounding variables, but their absence restricts the scope of analysis possible. With that being said, considering the lack of Twitter data available and the infeasibility of future access, the dataset is a very useful resource. 
+
+While the lack of confounding variables limits the ability to draw strong causal conclusions using the Difference-in-Differences (DiD) method, it remains the best approach given the inherent limitations of the dataset.  To strengthen the robustness of the analysis, an alternative approach could be to combine the dataset with external sources of data to attempt to control for latent trends and confounding factors. By integrating information from other relevant datasets, such as political sentiment indicators, demographic trends, or social media engagement patterns, researchers may be able to better interpret the causal effects of user suspension. Ultimately, I believe the conclusions drawn by McCabe et al. are justified, though perhaps only marginally so, given the limitations inherent in the dataset. Nonetheless, their work represents an important contribution to the understanding of misinformation and its potential consequences. I do believe that misinformation poses a significant risk, as it can influence public opinion, spread false narratives, and potentially destabilize societal trust. However, this project has also shown that data science has limitations in addressing this issue, especially when data access is restricted, and when only partial signals are available to measure the full impact.
 
 ## Sources
 McCabe, S.D., Ferrari, D., Green, J. et al. Post-January 6th deplatforming reduced the reach of misinformation on Twitter. Nature 630, 132–140 (2024). https://doi.org/10.1038/s41586-024-07524-8
